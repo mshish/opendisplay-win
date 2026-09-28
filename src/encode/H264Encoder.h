@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <memory>
 #include <vector>
 
@@ -43,6 +44,9 @@ public:
     // from Windows instead of from the receiver's `hello`.
     uint32_t Width() const;
     uint32_t Height() const;
+
+    // Friendly name of the activated H.264 MFT (empty if unknown).
+    std::wstring MftName() const;
 
 private:
     struct Impl;

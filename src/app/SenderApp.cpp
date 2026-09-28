@@ -232,7 +232,17 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             return false;
         }
         input.SetMonitorRect(vdisp.MonitorRect());
-        Logf(ip, "pipeline ready: %ux%u\n", dup.Width(), dup.Height());
+        {
+            const std::wstring mftW = encoder.MftName();
+            std::string mft;
+            mft.reserve(mftW.size());
+            for (wchar_t c : mftW)
+                mft.push_back(c >= 32 && c < 127 ? static_cast<char>(c) : '?');
+            if (mft.empty())
+                mft = "(unknown)";
+            Logf(ip, "pipeline ready: %ux%u @ %u fps / %u kbps, MFT: %s\n",
+                 dup.Width(), dup.Height(), kFps, kBitrateBps / 1000, mft.c_str());
+        }
         return true;
     };
 

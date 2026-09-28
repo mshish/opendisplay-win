@@ -2,6 +2,7 @@
 #include "encode/AnnexB.h"
 
 #include <atomic>
+#include <string>
 #include <codecapi.h>
 #include <icodecapi.h>
 #include <mfapi.h>
@@ -51,6 +52,7 @@ void TrySetBool(ICodecAPI* api, const GUID& key, bool value)
 
 struct H264Encoder::Impl {
     ComPtr<IMFTransform> mft;
+    std::wstring mftName;
     ComPtr<IMFMediaEventGenerator> eventGen;
     ComPtr<ICodecAPI> codecApi;
     bool isAsync = false;
@@ -86,6 +88,17 @@ struct H264Encoder::Impl {
         }
 
         mft.Reset();
+        mftName.clear();
+        // Friendly name before ActivateObject (survives for logging).
+        {
+            WCHAR* friendly = nullptr;
+            UINT32 friendlyLen = 0;
+            if (SUCCEEDED(activates[0]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &friendly, &friendlyLen)) &&
+                friendly) {
+                mftName.assign(friendly);
+                CoTaskMemFree(friendly);
+            }
+        }
         hr = activates[0]->ActivateObject(IID_PPV_ARGS(mft.ReleaseAndGetAddressOf()));
         for (UINT32 i = 0; i < count; ++i)
             activates[i]->Release();
@@ -383,6 +396,12 @@ uint32_t H264Encoder::Width() const
 uint32_t H264Encoder::Height() const
 {
     return impl_->height;
+}
+
+
+std::wstring H264Encoder::MftName() const
+{
+    return impl_ ? impl_->mftName : std::wstring{};
 }
 
 } // namespace od
