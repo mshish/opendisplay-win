@@ -3,6 +3,7 @@
 #include "app/Log.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cwctype>
 #include <atomic>
 #include <string>
@@ -62,6 +63,7 @@ struct H264Encoder::Impl {
     ComPtr<ICodecAPI> codecApi;
     bool isAsync = false;
     bool pendingNeedInput = false;
+    bool asyncTimedOut = false;
     bool providesSamples = false;
     DWORD outputBufferSize = 0;
 
@@ -108,23 +110,15 @@ struct H264Encoder::Impl {
         auto has = [&](const wchar_t* sub) { return lower.find(sub) != std::wstring::npos; };
         if (has(L"nvidia") || has(L"nvenc"))
             return 0;
-        // Intel QSV on Optimus often ActivateObject-succeeds then deadlocks the
-        // async GetEvent path when DXGI capture is on a different adapter.
-        // Skip it in the HW walk; software (or DX12 AVC) is safer until we can
-        // bind a D3D device manager to the encoder.
+        // Prefer Intel QSV after NVIDIA: same-side as typical Parsec/iGPU
+        // capture on Optimus, unlike NVENC which often ActivateObject-fails.
         if (has(L"intel") || has(L"quick sync") || has(L"qsv"))
-            return -1;
+            return 1;
         if (has(L"amd") || has(L"vce") || has(L"amf") || has(L"radeon"))
             return 2;
         return 3;
     }
 
-    static bool ShouldSkipHwCandidate(const std::wstring& name, int preference)
-    {
-        if (preference < 0)
-            return true;
-        return false;
-    }
 
     void ResetMft()
     {
@@ -236,7 +230,59 @@ struct H264Encoder::Impl {
         mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
+        if (!ProbeFirstFrame()) {
+            ResetMft();
+            act->ShutdownObject();
+            return false;
+        }
+
         Logf("encoder", "MFT bound: %s (%s)\n", NarrowAscii(name).c_str(), isAsync ? "async" : "sync");
+        return true;
+    }
+
+
+    // Feed one black NV12 frame. Async MFTs that never signal NeedInput fail
+    // the probe so Configure can try the next activate instead of hanging the UI.
+    bool ProbeFirstFrame()
+    {
+        asyncTimedOut = false;
+        pendingNeedInput = false;
+
+        const DWORD expected = width * height * 3 / 2;
+        std::vector<uint8_t> nv12(expected, 0);
+        // Dark grey Y + neutral UV so the encoder sees a valid planar frame.
+        std::fill(nv12.begin(), nv12.begin() + static_cast<std::ptrdiff_t>(width * height), static_cast<uint8_t>(0x10));
+        std::fill(nv12.begin() + static_cast<std::ptrdiff_t>(width * height), nv12.end(), static_cast<uint8_t>(0x80));
+
+        ComPtr<IMFMediaBuffer> buffer;
+        MFCreateMemoryBuffer(expected, &buffer);
+        BYTE* dst = nullptr;
+        buffer->Lock(&dst, nullptr, nullptr);
+        memcpy(dst, nv12.data(), expected);
+        buffer->Unlock();
+        buffer->SetCurrentLength(expected);
+
+        ComPtr<IMFSample> sample;
+        MFCreateSample(&sample);
+        sample->AddBuffer(buffer.Get());
+        sample->SetSampleTime(0);
+        sample->SetSampleDuration(frameDuration100ns > 0 ? frameDuration100ns : 333333);
+
+        std::vector<EncodedFrame> out;
+        if (isAsync) {
+            PumpAsync(sample.Get(), out);
+            if (asyncTimedOut) {
+                Logf("encoder", "MFT probe timed out (NeedInput): %s\n", NarrowAscii(mftName).c_str());
+                return false;
+            }
+        } else {
+            if (FAILED(mft->ProcessInput(0, sample.Get(), 0))) {
+                Logf("encoder", "MFT probe ProcessInput failed: %s\n", NarrowAscii(mftName).c_str());
+                return false;
+            }
+            DrainSync(out);
+        }
+        Logf("encoder", "MFT probe ok: %s (%zu au)\n", NarrowAscii(mftName).c_str(), out.size());
         return true;
     }
 
@@ -288,10 +334,6 @@ struct H264Encoder::Impl {
 
         bool ok = false;
         for (const auto& c : candidates) {
-            if (hardware && ShouldSkipHwCandidate(c.name, c.preference)) {
-                Logf("encoder", "MFT skip (unsafe on this capture path): %s\n", NarrowAscii(c.name).c_str());
-                continue;
-            }
             if (TryBindActivate(c.act, c.name, width, height, fps, bitrateBps)) {
                 ok = true;
                 break;
@@ -422,7 +464,8 @@ struct H264Encoder::Impl {
                 HRESULT hr = eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
                 if (hr == MF_E_NO_EVENTS_AVAILABLE) {
                     if (GetTickCount() - start >= kNeedInputTimeoutMs) {
-                        Logf("encoder", "async MFT timed out waiting for NeedInput (%lu ms) — dropping frame\n",
+                        asyncTimedOut = true;
+                        Logf("encoder", "async MFT timed out waiting for NeedInput (%lu ms)\n",
                              static_cast<unsigned long>(kNeedInputTimeoutMs));
                         return;
                     }

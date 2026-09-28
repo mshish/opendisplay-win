@@ -110,10 +110,13 @@ struct PanelHolder {
     }
 };
 
-uint32_t EvenClamp(int32_t v, uint32_t fallback)
+uint32_t Align16Clamp(int32_t v, uint32_t fallback)
 {
     uint32_t u = v > 0 ? static_cast<uint32_t>(v) : fallback;
-    return u & ~1u; // NV12 4:2:0 needs even dimensions
+    u &= ~15u; // H.264 / QSV want multiples of 16 (also keeps NV12 chroma even)
+    if (u == 0)
+        u = fallback & ~15u;
+    return u;
 }
 
 // usbmuxd cannot carry UDP (PROTOCOL 6.3). Loopback dials are the USB
@@ -309,8 +312,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         bool welcomeSent = conn->SendFrame(reinterpret_cast<const uint8_t*>(kWelcome), sizeof(kWelcome) - 1);
         Logf(ip, "welcome sent: %s\n", welcomeSent ? "yes" : "FAILED");
 
-        uint32_t width = EvenClamp(hello.pixelsWide, 1920);
-        uint32_t height = EvenClamp(hello.pixelsHigh, 1080);
+        uint32_t width = Align16Clamp(hello.pixelsWide, 1920);
+        uint32_t height = Align16Clamp(hello.pixelsHigh, 1080);
         Logf(ip, "hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
 
         // Only iPads of the panel size that is already on the air may join (see
@@ -392,8 +395,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         // pipelineMutex — the capture loop compares the
                         // monitor against them (see the panel-size watchdog).
                         std::lock_guard<std::mutex> lock(pipelineMutex);
-                        uint32_t w = EvenClamp(msg->hello.pixelsWide, width);
-                        uint32_t h = EvenClamp(msg->hello.pixelsHigh, height);
+                        uint32_t w = Align16Clamp(msg->hello.pixelsWide, width);
+                        uint32_t h = Align16Clamp(msg->hello.pixelsHigh, height);
                         Logf(ip, "hello again: %dx%d -> rebuilding pipeline at %ux%u\n", msg->hello.pixelsWide,
                                msg->hello.pixelsHigh, w, h);
                         // Turning the iPad changes the size under the claim.
