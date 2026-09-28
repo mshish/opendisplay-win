@@ -64,6 +64,9 @@ struct H264Encoder::Impl {
     bool isAsync = false;
     bool pendingNeedInput = false;
     bool asyncTimedOut = false;
+    bool lastAsyncTimedOut = false;
+    int consecutiveAsyncTimeouts = 0;
+    bool allowHardware = true;
     bool providesSamples = false;
     DWORD outputBufferSize = 0;
 
@@ -249,39 +252,80 @@ struct H264Encoder::Impl {
         pendingNeedInput = false;
 
         const DWORD expected = width * height * 3 / 2;
-        std::vector<uint8_t> nv12(expected, 0);
-        // Dark grey Y + neutral UV so the encoder sees a valid planar frame.
-        std::fill(nv12.begin(), nv12.begin() + static_cast<std::ptrdiff_t>(width * height), static_cast<uint8_t>(0x10));
-        std::fill(nv12.begin() + static_cast<std::ptrdiff_t>(width * height), nv12.end(), static_cast<uint8_t>(0x80));
+        auto make_sample = [&](LONGLONG pts) -> ComPtr<IMFSample> {
+            std::vector<uint8_t> nv12(expected, 0);
+            std::fill(nv12.begin(), nv12.begin() + static_cast<std::ptrdiff_t>(width * height),
+                      static_cast<uint8_t>(0x10));
+            std::fill(nv12.begin() + static_cast<std::ptrdiff_t>(width * height), nv12.end(),
+                      static_cast<uint8_t>(0x80));
 
-        ComPtr<IMFMediaBuffer> buffer;
-        MFCreateMemoryBuffer(expected, &buffer);
-        BYTE* dst = nullptr;
-        buffer->Lock(&dst, nullptr, nullptr);
-        memcpy(dst, nv12.data(), expected);
-        buffer->Unlock();
-        buffer->SetCurrentLength(expected);
+            ComPtr<IMFMediaBuffer> buffer;
+            MFCreateMemoryBuffer(expected, &buffer);
+            BYTE* dst = nullptr;
+            buffer->Lock(&dst, nullptr, nullptr);
+            memcpy(dst, nv12.data(), expected);
+            buffer->Unlock();
+            buffer->SetCurrentLength(expected);
 
-        ComPtr<IMFSample> sample;
-        MFCreateSample(&sample);
-        sample->AddBuffer(buffer.Get());
-        sample->SetSampleTime(0);
-        sample->SetSampleDuration(frameDuration100ns > 0 ? frameDuration100ns : 333333);
+            ComPtr<IMFSample> sample;
+            MFCreateSample(&sample);
+            sample->AddBuffer(buffer.Get());
+            sample->SetSampleTime(pts);
+            sample->SetSampleDuration(frameDuration100ns > 0 ? frameDuration100ns : 333333);
+            return sample;
+        };
 
         std::vector<EncodedFrame> out;
-        if (isAsync) {
-            PumpAsync(sample.Get(), out);
-            if (asyncTimedOut) {
-                Logf("encoder", "MFT probe timed out (NeedInput): %s\n", NarrowAscii(mftName).c_str());
-                return false;
+        const LONGLONG dur = frameDuration100ns > 0 ? frameDuration100ns : 333333;
+
+        auto feed = [&](LONGLONG pts) {
+            ComPtr<IMFSample> sample = make_sample(pts);
+            if (isAsync) {
+                PumpAsync(sample.Get(), out);
+            } else {
+                if (SUCCEEDED(mft->ProcessInput(0, sample.Get(), 0)))
+                    DrainSync(out);
             }
-        } else {
-            if (FAILED(mft->ProcessInput(0, sample.Get(), 0))) {
-                Logf("encoder", "MFT probe ProcessInput failed: %s\n", NarrowAscii(mftName).c_str());
-                return false;
-            }
-            DrainSync(out);
+        };
+
+        feed(0);
+        if (asyncTimedOut) {
+            Logf("encoder", "MFT probe timed out (NeedInput): %s\n", NarrowAscii(mftName).c_str());
+            return false;
         }
+
+        // Async QSV has accepted NeedInput with 0 AU before; wait briefly for
+        // HaveOutput, then feed a second IDR-forced frame if still empty.
+        if (out.empty() && isAsync) {
+            const DWORD start = GetTickCount();
+            while (out.empty() && GetTickCount() - start < 500) {
+                DrainAvailableAsync(out);
+                if (out.empty())
+                    Sleep(1);
+            }
+        }
+        if (out.empty()) {
+            TrySetUInt32(codecApi.Get(), CODECAPI_AVEncVideoForceKeyFrame, TRUE);
+            feed(dur);
+            if (asyncTimedOut) {
+                Logf("encoder", "MFT probe timed out on 2nd frame: %s\n", NarrowAscii(mftName).c_str());
+                return false;
+            }
+            if (out.empty() && isAsync) {
+                const DWORD start = GetTickCount();
+                while (out.empty() && GetTickCount() - start < 500) {
+                    DrainAvailableAsync(out);
+                    if (out.empty())
+                        Sleep(1);
+                }
+            }
+        }
+
+        if (out.empty()) {
+            Logf("encoder", "MFT probe produced no AU: %s\n", NarrowAscii(mftName).c_str());
+            return false;
+        }
+
         Logf("encoder", "MFT probe ok: %s (%zu au)\n", NarrowAscii(mftName).c_str(), out.size());
         return true;
     }
@@ -486,9 +530,50 @@ struct H264Encoder::Impl {
         }
         pendingNeedInput = false;
 
-        mft->ProcessInput(0, sample, 0);
+        HRESULT phr = mft->ProcessInput(0, sample, 0);
+        if (FAILED(phr)) {
+            Logf("encoder", "async ProcessInput failed hr=0x%08lX\n", static_cast<unsigned long>(phr));
+            return;
+        }
 
-        DrainAvailableAsync(out);
+        // QSV often posts HaveOutput asynchronously. A single NO_WAIT drain can
+        // leave the AU queued and the next frame never sees NeedInput (black
+        // video). Poll briefly for output / the next NeedInput.
+        {
+            const DWORD kOutputTimeoutMs = 500;
+            const DWORD start = GetTickCount();
+            bool sawOutputOrNeed = false;
+            while (GetTickCount() - start < kOutputTimeoutMs) {
+                DrainAvailableAsync(out);
+                if (pendingNeedInput || !out.empty()) {
+                    sawOutputOrNeed = true;
+                    break;
+                }
+                ComPtr<IMFMediaEvent> event;
+                HRESULT hr = eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+                if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+                    Sleep(1);
+                    continue;
+                }
+                if (FAILED(hr))
+                    break;
+                MediaEventType met = MEUnknown;
+                event->GetType(&met);
+                if (met == METransformHaveOutput) {
+                    ProcessOutputOnce(out);
+                    sawOutputOrNeed = true;
+                } else if (met == METransformNeedInput) {
+                    pendingNeedInput = true;
+                    sawOutputOrNeed = true;
+                    break;
+                }
+            }
+            if (!sawOutputOrNeed && out.empty()) {
+                asyncTimedOut = true;
+                Logf("encoder", "async MFT timed out waiting for HaveOutput (%lu ms)\n",
+                     static_cast<unsigned long>(kOutputTimeoutMs));
+            }
+        }
     }
 
 
@@ -534,8 +619,15 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
     // Walk every hardware activate (NVIDIA first), then software. Previously we
     // only ActivateObject'd activates[0]; one bad first entry dropped us on the
     // Microsoft software MFT with no HRESULT in the log.
-    if (!impl_->EnumAndBind(/*hardware=*/true, width, height, fps, bitrateBps) &&
-        !impl_->EnumAndBind(/*hardware=*/false, width, height, fps, bitrateBps)) {
+    impl_->consecutiveAsyncTimeouts = 0;
+    impl_->lastAsyncTimedOut = false;
+
+    bool ok = false;
+    if (impl_->allowHardware)
+        ok = impl_->EnumAndBind(/*hardware=*/true, width, height, fps, bitrateBps);
+    if (!ok)
+        ok = impl_->EnumAndBind(/*hardware=*/false, width, height, fps, bitrateBps);
+    if (!ok) {
         Logf("encoder", "no H.264 MFT could be configured for %ux%u @ %u\n", width, height, fps);
         return false;
     }
@@ -547,6 +639,7 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
 std::vector<EncodedFrame> H264Encoder::EncodeNv12(const uint8_t* nv12, size_t size)
 {
     std::vector<EncodedFrame> outFrames;
+    impl_->lastAsyncTimedOut = false;
     if (!impl_->configured)
         return outFrames;
 
@@ -574,10 +667,18 @@ std::vector<EncodedFrame> H264Encoder::EncodeNv12(const uint8_t* nv12, size_t si
     }
 
     if (impl_->isAsync) {
+        impl_->asyncTimedOut = false;
         impl_->PumpAsync(sample.Get(), outFrames);
+        if (impl_->asyncTimedOut) {
+            impl_->lastAsyncTimedOut = true;
+            ++impl_->consecutiveAsyncTimeouts;
+        } else {
+            impl_->consecutiveAsyncTimeouts = 0;
+        }
     } else {
         if (SUCCEEDED(impl_->mft->ProcessInput(0, sample.Get(), 0)))
             impl_->DrainSync(outFrames);
+        impl_->consecutiveAsyncTimeouts = 0;
     }
 
     return outFrames;
@@ -607,6 +708,22 @@ uint32_t H264Encoder::Height() const
 std::wstring H264Encoder::MftName() const
 {
     return impl_ ? impl_->mftName : std::wstring{};
+}
+
+bool H264Encoder::TookAsyncTimeout() const
+{
+    return impl_ && impl_->lastAsyncTimedOut;
+}
+
+int H264Encoder::ConsecutiveAsyncTimeouts() const
+{
+    return impl_ ? impl_->consecutiveAsyncTimeouts : 0;
+}
+
+void H264Encoder::SetAllowHardware(bool allow)
+{
+    if (impl_)
+        impl_->allowHardware = allow;
 }
 
 } // namespace od
