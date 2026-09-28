@@ -217,8 +217,12 @@ struct H264Encoder::Impl {
 
         codecApi.Reset();
         if (SUCCEEDED(mft.As(&codecApi))) {
-            TrySetUInt32(codecApi.Get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
-            TrySetUInt32(codecApi.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrateBps);
+            // Peak-constrained VBR: idle desktop stays cheap; motion can rise
+            // up to bitrateBps. Unconstrained VBR can spike and stall Wi-Fi.
+            TrySetUInt32(codecApi.Get(), CODECAPI_AVEncCommonRateControlMode,
+                         eAVEncCommonRateControlMode_PeakConstrainedVBR);
+            TrySetUInt32(codecApi.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrateBps * 6 / 10);
+            TrySetUInt32(codecApi.Get(), CODECAPI_AVEncCommonMaxBitRate, bitrateBps);
             TrySetUInt32(codecApi.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
             TrySetBool(codecApi.Get(), CODECAPI_AVLowLatencyMode, true);
             // Without an explicit GOP size some MFTs (observed with NVENC here)

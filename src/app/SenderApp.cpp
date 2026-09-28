@@ -24,8 +24,8 @@ namespace od {
 
 namespace {
 
-constexpr uint32_t kFps = 60;
-constexpr uint32_t kBitrateBps = 30'000'000;
+constexpr uint32_t kFps = 30;
+constexpr uint32_t kBitrateBps = 10'000'000; // peak for constrained VBR
 constexpr int kSendTimeoutMs = 500;      // backpressure: how long to wait for the socket before dropping a frame
 constexpr int kReconnectDelayMs = 2000;
 constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well under the iPad's ~5s watchdog
@@ -240,7 +240,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 mft.push_back(c >= 32 && c < 127 ? static_cast<char>(c) : '?');
             if (mft.empty())
                 mft = "(unknown)";
-            Logf(ip, "pipeline ready: %ux%u @ %u fps / %u kbps, MFT: %s\n",
+            Logf(ip, "pipeline ready: %ux%u @ %u fps / VBR peak %u kbps, MFT: %s\n",
                  dup.Width(), dup.Height(), kFps, kBitrateBps / 1000, mft.c_str());
         }
         return true;
