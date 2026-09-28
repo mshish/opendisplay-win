@@ -464,6 +464,12 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         }
                         break;
                     }
+                    case ControlType::Stats:
+                        // Free-form receiver telemetry (~5s). Prefix matches the
+                        // Mac sender so one log file tells the whole story.
+                        Logf(ip, "PHONE-STATS %.*s\n", static_cast<int>(frame->size()),
+                             reinterpret_cast<const char*>(frame->data()));
+                        break;
                     default:
                         break;
                 }
