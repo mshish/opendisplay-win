@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -120,26 +121,34 @@ uint32_t Align16Clamp(int32_t v, uint32_t fallback)
     return u;
 }
 
-// Crop NV12 to encoder size when capture is larger (Parsec mode may not match
-// the 16-aligned hello size exactly).
-bool CropNv12TopLeft(const std::vector<uint8_t>& src, uint32_t srcW, uint32_t srcH,
-                     uint32_t dstW, uint32_t dstH, std::vector<uint8_t>& dst)
+// Pad NV12 up to encoder size (16-ceil of capture). Floor-crop (1080->1072)
+// made every frame look like a size change and reconfigure-flashed black.
+bool PadNv12TopLeft(const std::vector<uint8_t>& src, uint32_t srcW, uint32_t srcH,
+                    uint32_t dstW, uint32_t dstH, std::vector<uint8_t>& dst)
 {
-    if (dstW == 0 || dstH == 0 || srcW < dstW || srcH < dstH)
+    if (dstW == 0 || dstH == 0 || dstW < srcW || dstH < srcH)
         return false;
     if (srcW == dstW && srcH == dstH) {
         dst = src;
         return true;
     }
-    dst.resize(dstW * dstH * 3 / 2);
-    for (uint32_t y = 0; y < dstH; ++y)
-        memcpy(dst.data() + y * dstW, src.data() + y * srcW, dstW);
+    dst.assign(dstW * dstH * 3 / 2, 0);
+    std::fill(dst.begin() + static_cast<std::ptrdiff_t>(dstW * dstH), dst.end(),
+              static_cast<uint8_t>(0x80));
+    for (uint32_t y = 0; y < srcH; ++y)
+        memcpy(dst.data() + y * dstW, src.data() + y * srcW, srcW);
     const uint8_t* srcUv = src.data() + srcW * srcH;
     uint8_t* dstUv = dst.data() + dstW * dstH;
-    for (uint32_t y = 0; y < dstH / 2; ++y)
-        memcpy(dstUv + y * dstW, srcUv + y * srcW, dstW);
+    for (uint32_t y = 0; y < srcH / 2; ++y)
+        memcpy(dstUv + y * dstW, srcUv + y * srcW, srcW);
     return true;
 }
+
+uint32_t Align16Ceil(uint32_t v)
+{
+    return (v + 15u) & ~15u;
+}
+
 
 // usbmuxd cannot carry UDP (PROTOCOL 6.3). Loopback dials are the USB
 // binding on Windows when we add it; ignore cursorPort there.
@@ -252,14 +261,14 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             Logf(ip, "DesktopDuplication::Open failed\n");
             return false;
         }
-        const uint32_t encW = dup.Width() & ~15u;
-        const uint32_t encH = dup.Height() & ~15u;
+        const uint32_t encW = Align16Ceil(dup.Width());
+        const uint32_t encH = Align16Ceil(dup.Height());
         if (encW == 0 || encH == 0) {
             Logf(ip, "encoder size align failed (dup %ux%u)\n", dup.Width(), dup.Height());
             return false;
         }
         if (encW != dup.Width() || encH != dup.Height())
-            Logf(ip, "encode size %ux%u (capture %ux%u, 16-aligned)\n",
+            Logf(ip, "encode size %ux%u (capture %ux%u, 16-ceil pad)\n",
                  encW, encH, dup.Width(), dup.Height());
         if (!encoder.Configure(encW, encH, kFps, kBitrateBps)) {
             Logf(ip, "encoder configure failed\n");
@@ -616,10 +625,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // while nv12 still holds the previous frame. Reconfiguring on
                 // that would encode the old buffer with the new stride — one
                 // skewed frame, exactly what this is here to prevent.
-                if (changed && (encoder.Width() != dup.Width() || encoder.Height() != dup.Height())) {
+                const uint32_t wantW = Align16Ceil(dup.Width());
+                const uint32_t wantH = Align16Ceil(dup.Height());
+                if (changed && (encoder.Width() != wantW || encoder.Height() != wantH)) {
                     Logf(ip, "capture is now %ux%u (encoder had %ux%u), reconfiguring\n", dup.Width(), dup.Height(),
                            encoder.Width(), encoder.Height());
-                    if (encoder.Configure(dup.Width() & ~15u, dup.Height() & ~15u, kFps, kBitrateBps)) {
+                    encoder.SetAllowHardware(false); // size flip: keep software, skip QSV probe walk
+                    if (encoder.Configure(wantW, wantH, kFps, kBitrateBps)) {
                         // The cached rect is only refreshed when the monitor
                         // moves, and a rotation in place doesn't move it.
                         rectStale = !vdisp.QueryMonitorRect();
@@ -716,9 +728,9 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
                 if (running && (active || keepaliveDue)) {
                     std::vector<uint8_t> encNv12;
-                    if (!CropNv12TopLeft(nv12, dup.Width(), dup.Height(),
+                    if (!PadNv12TopLeft(nv12, dup.Width(), dup.Height(),
                                          encoder.Width(), encoder.Height(), encNv12)) {
-                        Logf(ip, "nv12 crop failed (cap %ux%u -> enc %ux%u)\n",
+                        Logf(ip, "nv12 pad failed (cap %ux%u -> enc %ux%u)\n",
                              dup.Width(), dup.Height(), encoder.Width(), encoder.Height());
                         continue;
                     }
