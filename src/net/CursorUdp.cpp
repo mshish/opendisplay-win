@@ -9,8 +9,10 @@ bool CursorUdp::Open(const std::string& host, uint16_t port)
 {
     Close();
 
+    // Match Connection::Connect: IPv4 only. AF_UNSPEC can pick an IPv6
+    // route while TCP is on v4, so cursorAck never comes back.
     addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
 
