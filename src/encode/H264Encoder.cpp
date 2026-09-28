@@ -9,6 +9,7 @@
 #include <vector>
 #include <codecapi.h>
 #include <icodecapi.h>
+#include <windows.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -107,11 +108,22 @@ struct H264Encoder::Impl {
         auto has = [&](const wchar_t* sub) { return lower.find(sub) != std::wstring::npos; };
         if (has(L"nvidia") || has(L"nvenc"))
             return 0;
+        // Intel QSV on Optimus often ActivateObject-succeeds then deadlocks the
+        // async GetEvent path when DXGI capture is on a different adapter.
+        // Skip it in the HW walk; software (or DX12 AVC) is safer until we can
+        // bind a D3D device manager to the encoder.
         if (has(L"intel") || has(L"quick sync") || has(L"qsv"))
-            return 1;
+            return -1;
         if (has(L"amd") || has(L"vce") || has(L"amf") || has(L"radeon"))
             return 2;
         return 3;
+    }
+
+    static bool ShouldSkipHwCandidate(const std::wstring& name, int preference)
+    {
+        if (preference < 0)
+            return true;
+        return false;
     }
 
     void ResetMft()
@@ -272,6 +284,10 @@ struct H264Encoder::Impl {
 
         bool ok = false;
         for (const auto& c : candidates) {
+            if (hardware && ShouldSkipHwCandidate(c.name, c.preference)) {
+                Logf("encoder", "MFT skip (unsafe on this capture path): %s\n", NarrowAscii(c.name).c_str());
+                continue;
+            }
             if (TryBindActivate(c.act, c.name, width, height, fps, bitrateBps)) {
                 ok = true;
                 break;
@@ -392,9 +408,24 @@ struct H264Encoder::Impl {
         DrainAvailableAsync(out);
 
         if (!pendingNeedInput) {
+            // Never block forever on GetEvent(0): Intel QSV has been observed to
+            // never signal NeedInput when capture is on another adapter, which
+            // freezes the whole sender (tray UI included).
+            const DWORD kNeedInputTimeoutMs = 500;
+            const DWORD start = GetTickCount();
             for (;;) {
                 ComPtr<IMFMediaEvent> event;
-                if (FAILED(eventGen->GetEvent(0, &event)))
+                HRESULT hr = eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+                if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+                    if (GetTickCount() - start >= kNeedInputTimeoutMs) {
+                        Logf("encoder", "async MFT timed out waiting for NeedInput (%lu ms) — dropping frame\n",
+                             static_cast<unsigned long>(kNeedInputTimeoutMs));
+                        return;
+                    }
+                    Sleep(1);
+                    continue;
+                }
+                if (FAILED(hr))
                     return;
 
                 MediaEventType met = MEUnknown;
@@ -412,6 +443,7 @@ struct H264Encoder::Impl {
 
         DrainAvailableAsync(out);
     }
+
 
     void DrainSync(std::vector<EncodedFrame>& out)
     {
