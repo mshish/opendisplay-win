@@ -32,7 +32,7 @@ constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well
 constexpr int kActiveTailMs = 300;       // keep feeding the encoder this long after the last change (drains its 1-frame hold)
 constexpr int kWrongSizeGraceMs = 3000;  // how long the monitor may sit on a foreign size before we rebuild it
 constexpr int kBlockedRetryMs = 5000;    // how often a waiting iPad checks whether the display is free again
-constexpr int kCursorUdpAckMs = 3000;    // drop UDP and stay on TCP if no cursorAck (PROTOCOL 6.3)
+constexpr int kCursorUdpAckMs = 5000;    // drop UDP and stay on TCP if no cursorAck (PROTOCOL 6.3)
 
 // Only one panel size may be on the air at a time.
 //
@@ -488,17 +488,31 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // started, and how many rebuilds we already spent on it.
 
         // WiFi only: dial hello.cursorPort on the same host as TCP.
+        std::string cursorProbe;
         if (hello.cursorPort > 0 && hello.cursorPort <= 65535 && !IsUsbLikeHost(ip)) {
             std::lock_guard<std::mutex> lock(cursorNetMutex);
             if (cursorUdp.Open(ip, static_cast<uint16_t>(hello.cursorPort))) {
                 cursorUdpOpened = std::chrono::steady_clock::now();
                 Logf(ip, "cursor UDP channel opened on %s:%d (mirroring TCP until cursorAck)\n",
                      ip.c_str(), hello.cursorPort);
+                // Probe immediately so cursorAck does not need a mouse move
+                // (PROTOCOL 6.3; Mac sender probes on UDP .ready).
+                ++cursorSeq;
+                cursorProbe = MakeCursorMessage(false, 0.0, 0.0, cursorSeq);
+                cursorUdp.Send(reinterpret_cast<const uint8_t*>(cursorProbe.data()),
+                               cursorProbe.size());
             } else {
                 Logf(ip, "cursor UDP open failed for port %d, staying on TCP\n", hello.cursorPort);
             }
         } else if (hello.cursorPort > 0 && IsUsbLikeHost(ip)) {
             Logf(ip, "ignoring cursorPort=%d on USB-like host\n", hello.cursorPort);
+        }
+        if (!cursorProbe.empty()) {
+            // Mirror the probe on TCP until ack (same seq; receiver dedups).
+            if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(cursorProbe.data()),
+                                 static_cast<uint32_t>(cursorProbe.size()))) {
+                running = false;
+            }
         }
 
         std::chrono::steady_clock::time_point wrongSizeSince{};
