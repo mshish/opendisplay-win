@@ -278,14 +278,34 @@ struct H264Encoder::Impl {
         std::vector<EncodedFrame> out;
         const LONGLONG dur = frameDuration100ns > 0 ? frameDuration100ns : 333333;
 
-        auto feed = [&](LONGLONG pts) {
-            ComPtr<IMFSample> sample = make_sample(pts);
-            if (isAsync) {
-                PumpAsync(sample.Get(), out);
-            } else {
+        // Sync software MFTs often buffer the first frame and return 0 AU from
+        // a single ProcessInput/Drain. Requiring an AU there rejected Microsoft
+        // software and caused a connect/configure/disconnect flash loop.
+        // Async HW (QSV) must produce HaveOutput / an AU or we fail the bind.
+        if (!isAsync) {
+            ComPtr<IMFSample> sample = make_sample(0);
+            HRESULT hr = mft->ProcessInput(0, sample.Get(), 0);
+            if (FAILED(hr)) {
+                Logf("encoder", "MFT probe ProcessInput failed: %s hr=0x%08lX\n",
+                     NarrowAscii(mftName).c_str(), static_cast<unsigned long>(hr));
+                return false;
+            }
+            DrainSync(out);
+            // Optional second IDR feed — still OK if 0 AU.
+            if (out.empty()) {
+                TrySetUInt32(codecApi.Get(), CODECAPI_AVEncVideoForceKeyFrame, TRUE);
+                sample = make_sample(dur);
                 if (SUCCEEDED(mft->ProcessInput(0, sample.Get(), 0)))
                     DrainSync(out);
             }
+            Logf("encoder", "MFT probe ok (sync): %s (%zu au)\n", NarrowAscii(mftName).c_str(),
+                 out.size());
+            return true;
+        }
+
+        auto feed = [&](LONGLONG pts) {
+            ComPtr<IMFSample> sample = make_sample(pts);
+            PumpAsync(sample.Get(), out);
         };
 
         feed(0);
@@ -293,10 +313,7 @@ struct H264Encoder::Impl {
             Logf("encoder", "MFT probe timed out (NeedInput): %s\n", NarrowAscii(mftName).c_str());
             return false;
         }
-
-        // Async QSV has accepted NeedInput with 0 AU before; wait briefly for
-        // HaveOutput, then feed a second IDR-forced frame if still empty.
-        if (out.empty() && isAsync) {
+        if (out.empty()) {
             const DWORD start = GetTickCount();
             while (out.empty() && GetTickCount() - start < 500) {
                 DrainAvailableAsync(out);
@@ -311,7 +328,7 @@ struct H264Encoder::Impl {
                 Logf("encoder", "MFT probe timed out on 2nd frame: %s\n", NarrowAscii(mftName).c_str());
                 return false;
             }
-            if (out.empty() && isAsync) {
+            if (out.empty()) {
                 const DWORD start = GetTickCount();
                 while (out.empty() && GetTickCount() - start < 500) {
                     DrainAvailableAsync(out);
@@ -320,7 +337,6 @@ struct H264Encoder::Impl {
                 }
             }
         }
-
         if (out.empty()) {
             Logf("encoder", "MFT probe produced no AU: %s\n", NarrowAscii(mftName).c_str());
             return false;
