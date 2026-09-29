@@ -27,7 +27,7 @@ std::wstring AppDataDir()
     return base + L"\\opendisplay-win";
 }
 
-// Minimal flat-JSON field lookups — the config only ever holds a handful of
+// Minimal flat-JSON field lookups - the config only ever holds a handful of
 // unnested string/number/bool values, so a full parser would be overkill.
 std::string_view ValueAfter(std::string_view json, std::string_view key)
 {
@@ -107,6 +107,19 @@ bool ReadBool(std::string_view json, std::string_view key, bool& out)
     return false;
 }
 
+// Normalize mode/preset strings; unknown -> defaults that match today's behavior.
+std::string NormalizeMode(const std::string& s)
+{
+    return (s == "fixed") ? "fixed" : "dynamic";
+}
+
+std::string NormalizePreset(const std::string& s)
+{
+    if (s == "balanced" || s == "quality")
+        return s;
+    return "speed";
+}
+
 } // namespace
 
 std::wstring Config::FilePath()
@@ -139,6 +152,21 @@ Config Config::Load()
         cfg.port = static_cast<uint16_t>(port);
     ReadBool(json, "autoReconnect", cfg.autoReconnect);
 
+    {
+        std::string v = ReadString(json, "usbEncodeMode");
+        if (!v.empty())
+            cfg.usbEncodeMode = NormalizeMode(v);
+        v = ReadString(json, "usbEncodePreset");
+        if (!v.empty())
+            cfg.usbEncodePreset = NormalizePreset(v);
+        v = ReadString(json, "wifiEncodeMode");
+        if (!v.empty())
+            cfg.wifiEncodeMode = NormalizeMode(v);
+        v = ReadString(json, "wifiEncodePreset");
+        if (!v.empty())
+            cfg.wifiEncodePreset = NormalizePreset(v);
+    }
+
     return cfg;
 }
 
@@ -153,7 +181,7 @@ void Config::Save() const
 
     // The names are free text from the settings dialog, and both the writer
     // here and the reader above are hand-rolled: an unescaped quote in a name
-    // would split the entry at the wrong place on the next load — the name
+    // would split the entry at the wrong place on the next load - the name
     // truncated, the rest read back as another device. Quotes and backslashes
     // are dropped rather than escaped, because nothing needs them in a name and
     // dropping keeps the reader as simple as it is.
@@ -171,7 +199,11 @@ void Config::Save() const
         file << (i == 0 ? "\"" : ", \"") << plain(devices[i]) << "\"";
     file << "],\n"
          << "  \"port\": " << port << ",\n"
-         << "  \"autoReconnect\": " << (autoReconnect ? "true" : "false") << "\n"
+         << "  \"autoReconnect\": " << (autoReconnect ? "true" : "false") << ",\n"
+         << "  \"usbEncodeMode\": \"" << NormalizeMode(usbEncodeMode) << "\",\n"
+         << "  \"usbEncodePreset\": \"" << NormalizePreset(usbEncodePreset) << "\",\n"
+         << "  \"wifiEncodeMode\": \"" << NormalizeMode(wifiEncodeMode) << "\",\n"
+         << "  \"wifiEncodePreset\": \"" << NormalizePreset(wifiEncodePreset) << "\"\n"
          << "}\n";
 }
 

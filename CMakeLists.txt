@@ -16,6 +16,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_executable(opendisplay-win
   src/main.cpp
   src/net/Connection.cpp
+  src/net/UsbMux.cpp
   src/net/Protocol.cpp
   src/net/CursorMessages.cpp
   src/net/CursorUdp.cpp
@@ -24,6 +25,8 @@ add_executable(opendisplay-win
   src/encode/H264Encoder.cpp
   src/display/VirtualDisplay.cpp
   src/display/DesktopDuplication.cpp
+  src/display/ExistingMonitor.cpp
+  src/display/MttVddSettings.cpp
   src/input/InputInjector.cpp
   src/app/Log.cpp
   src/app/SenderApp.cpp
@@ -76,3 +79,25 @@ target_link_options(opendisplay-win PRIVATE
   "/SUBSYSTEM:WINDOWS"
   "/ENTRY:mainCRTStartup"
 )
+
+
+# Standalone Media Foundation H.264 encoder probe (no capture/network).
+add_executable(mft_encoder_probe
+  tools/mft_encoder_probe/main.cpp
+)
+target_compile_definitions(mft_encoder_probe PRIVATE
+  UNICODE
+  _UNICODE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+)
+target_link_libraries(mft_encoder_probe PRIVATE
+  mfplat
+  mf
+  mfuuid
+  ole32
+  d3d11
+  dxgi
+)
+# Console subsystem so printf is visible when run from a terminal.
+set_target_properties(mft_encoder_probe PROPERTIES WIN32_EXECUTABLE FALSE)

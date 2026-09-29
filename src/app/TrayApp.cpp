@@ -368,6 +368,66 @@ void ApplyAndRestart(TrayContext* ctx)
     UpdateStatus(ctx);
 }
 
+
+void FillEncodeCombos(HWND dlg)
+{
+    auto fillMode = [&](int id) {
+        HWND cb = GetDlgItem(dlg, id);
+        SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Dynamic"));
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Fixed"));
+    };
+    auto fillPreset = [&](int id) {
+        HWND cb = GetDlgItem(dlg, id);
+        SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Speed"));
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Balanced"));
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Quality"));
+    };
+    fillMode(IDC_USB_ENCODE_MODE);
+    fillMode(IDC_WIFI_ENCODE_MODE);
+    fillPreset(IDC_USB_ENCODE_PRESET);
+    fillPreset(IDC_WIFI_ENCODE_PRESET);
+}
+
+void SelectEncodeCombos(HWND dlg, const Config& cfg)
+{
+    auto selMode = [&](int id, const std::string& mode) {
+        SendDlgItemMessageW(dlg, id, CB_SETCURSEL, mode == "fixed" ? 1 : 0, 0);
+    };
+    auto selPreset = [&](int id, const std::string& preset) {
+        int idx = 0;
+        if (preset == "balanced")
+            idx = 1;
+        else if (preset == "quality")
+            idx = 2;
+        SendDlgItemMessageW(dlg, id, CB_SETCURSEL, idx, 0);
+    };
+    selMode(IDC_USB_ENCODE_MODE, cfg.usbEncodeMode);
+    selMode(IDC_WIFI_ENCODE_MODE, cfg.wifiEncodeMode);
+    selPreset(IDC_USB_ENCODE_PRESET, cfg.usbEncodePreset);
+    selPreset(IDC_WIFI_ENCODE_PRESET, cfg.wifiEncodePreset);
+}
+
+void ReadEncodeCombos(HWND dlg, Config& cfg)
+{
+    auto modeOf = [&](int id) -> std::string {
+        return SendDlgItemMessageW(dlg, id, CB_GETCURSEL, 0, 0) == 1 ? "fixed" : "dynamic";
+    };
+    auto presetOf = [&](int id) -> std::string {
+        LRESULT i = SendDlgItemMessageW(dlg, id, CB_GETCURSEL, 0, 0);
+        if (i == 1)
+            return "balanced";
+        if (i == 2)
+            return "quality";
+        return "speed";
+    };
+    cfg.usbEncodeMode = modeOf(IDC_USB_ENCODE_MODE);
+    cfg.wifiEncodeMode = modeOf(IDC_WIFI_ENCODE_MODE);
+    cfg.usbEncodePreset = presetOf(IDC_USB_ENCODE_PRESET);
+    cfg.wifiEncodePreset = presetOf(IDC_WIFI_ENCODE_PRESET);
+}
+
 INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -381,6 +441,8 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
             SetDlgItemInt(dlg, IDC_PORT, cfg->port, FALSE);
             CheckDlgButton(dlg, IDC_AUTORECONNECT, cfg->autoReconnect ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(dlg, IDC_AUTOSTART, IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED);
+            FillEncodeCombos(dlg);
+            SelectEncodeCombos(dlg, *cfg);
             return TRUE;
         }
         case WM_COMMAND:
@@ -420,6 +482,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
                     cfg->port = static_cast<uint16_t>(port);
                 cfg->autoReconnect = IsDlgButtonChecked(dlg, IDC_AUTORECONNECT) == BST_CHECKED;
                 SetAutostart(IsDlgButtonChecked(dlg, IDC_AUTOSTART) == BST_CHECKED);
+                ReadEncodeCombos(dlg, *cfg);
                 EndDialog(dlg, IDOK);
                 return TRUE;
             }
@@ -469,6 +532,35 @@ void ShowContextMenu(HWND hwnd, TrayContext* ctx)
     DestroyMenu(menu);
 }
 
+
+// Shared by tray Settings... and tray double-click: mutate cfg via dialog, then
+// Save + ApplyAndRestart when targets or encode profile actually changed.
+void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
+{
+    std::vector<std::string> oldDevices = ctx->cfg.devices;
+    uint16_t oldPort = ctx->cfg.port;
+    const std::string oldUsbMode = ctx->cfg.usbEncodeMode;
+    const std::string oldUsbPreset = ctx->cfg.usbEncodePreset;
+    const std::string oldWifiMode = ctx->cfg.wifiEncodeMode;
+    const std::string oldWifiPreset = ctx->cfg.wifiEncodePreset;
+    if (DialogBoxParamW(ctx->hInstance, MAKEINTRESOURCEW(IDD_SETTINGS), hwnd, SettingsDlgProc,
+                        reinterpret_cast<LPARAM>(&ctx->cfg)) != IDOK)
+        return;
+    ctx->cfg.Save();
+    // Tear down and reconnect when targets or encode profile changed -
+    // mode/preset only apply at connect time. Leave auto-connect/autostart-only
+    // OK alone so a live stream is not dropped for nothing.
+    const bool targetsChanged =
+        ctx->cfg.devices != oldDevices || ctx->cfg.port != oldPort;
+    const bool encodeChanged =
+        ctx->cfg.usbEncodeMode != oldUsbMode ||
+        ctx->cfg.usbEncodePreset != oldUsbPreset ||
+        ctx->cfg.wifiEncodeMode != oldWifiMode ||
+        ctx->cfg.wifiEncodePreset != oldWifiPreset;
+    if (targetsChanged || encodeChanged)
+        ApplyAndRestart(ctx);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     auto* ctx = reinterpret_cast<TrayContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -478,8 +570,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)
                 ShowContextMenu(hwnd, ctx);
             else if (LOWORD(lParam) == WM_LBUTTONDBLCLK)
-                DialogBoxParamW(ctx->hInstance, MAKEINTRESOURCEW(IDD_SETTINGS), hwnd, SettingsDlgProc,
-                                reinterpret_cast<LPARAM>(&ctx->cfg));
+                OpenSettingsAndApply(hwnd, ctx);
             return 0;
 
         case WM_COMMAND:
@@ -506,20 +597,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                         app->Stop();
                     UpdateStatus(ctx);
                     return 0;
-                case IDM_SETTINGS: {
-                    std::vector<std::string> oldDevices = ctx->cfg.devices;
-                    uint16_t oldPort = ctx->cfg.port;
-                    if (DialogBoxParamW(ctx->hInstance, MAKEINTRESOURCEW(IDD_SETTINGS), hwnd, SettingsDlgProc,
-                                        reinterpret_cast<LPARAM>(&ctx->cfg)) == IDOK) {
-                        ctx->cfg.Save();
-                        // Only tear down and reconnect if the *targets* actually
-                        // changed — toggling auto-connect/autostart, or OK with
-                        // no change, must not drop a live stream.
-                        if (ctx->cfg.devices != oldDevices || ctx->cfg.port != oldPort)
-                            ApplyAndRestart(ctx);
-                    }
+                case IDM_SETTINGS:
+                    OpenSettingsAndApply(hwnd, ctx);
                     return 0;
-                }
                 case IDM_RUNASADMIN: {
                     // Relaunch elevated, then exit this instance. Stop first so
                     // the per-iPad locks are released before the elevated copy

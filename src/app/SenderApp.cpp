@@ -1,23 +1,32 @@
 #include "app/SenderApp.h"
 
 #include "app/Log.h"
+#include "app/Config.h"
+#include "app/EncodeProfile.h"
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <utility>
 
 #include <winsock2.h>
 
 #include "display/DesktopDuplication.h"
+
+#include <wrl/client.h>
 #include "display/VirtualDisplay.h"
+#include "display/ExistingMonitor.h"
+#include "display/MttVddSettings.h"
 #include "encode/H264Encoder.h"
 #include "input/InputInjector.h"
 #include "net/Connection.h"
+#include "net/UsbMux.h"
 #include "net/CursorMessages.h"
 #include "net/CursorUdp.h"
 #include "net/Protocol.h"
@@ -26,9 +35,10 @@ namespace od {
 
 namespace {
 
-constexpr uint32_t kFps = 30;
-constexpr uint32_t kBitrateBps = 10'000'000; // peak for constrained VBR
+constexpr uint32_t kFps = 60;
 constexpr int kSendTimeoutMs = 500;      // backpressure: how long to wait for the socket before dropping a frame
+constexpr int kDynamicHealthyMs = 5000;  // climb peak back toward ceiling after this quiet stretch
+constexpr int kDynamicLogMinMs = 2000;   // sparse Dynamic peak-change logging
 constexpr int kReconnectDelayMs = 2000;
 constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well under the iPad's ~5s watchdog
 constexpr int kActiveTailMs = 300;       // keep feeding the encoder this long after the last change (drains its 1-frame hold)
@@ -38,11 +48,11 @@ constexpr int kCursorUdpAckMs = 5000;    // drop UDP and stay on TCP if no curso
 
 // Only one panel size may be on the air at a time.
 //
-// parsec-vdd puts a single custom resolution on all of its virtual monitors:
-// whichever sender sets its size last drags every other monitor along, and
-// those iPads then show a letterboxed desktop at the wrong aspect. Rather than
-// serve a wrong-shaped picture, iPads of the same panel size run together and
-// a different one waits until the display is free again.
+// Parsec VDD: one custom resolution is shared across all its virtual monitors,
+// so a second iPad with a different panel would get a letterboxed picture.
+// MTT VDD: modes are independent per monitor (merged into vdd_settings.xml),
+// but we still serialize panel sizes so two senders never fight over rebuilds.
+// Same-size iPads share; a different size waits until the display is free.
 //
 // Process-wide, because the tray drives every sender. A headless CLI sender
 // started next to the tray is outside this and can still take the mode with
@@ -149,6 +159,43 @@ uint32_t Align16Ceil(uint32_t v)
     return (v + 15u) & ~15u;
 }
 
+int64_t UnixEpochMs()
+{
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+// PROTOCOL 5.1 telemetry prefix - must precede the first 00 00 00 01 start code.
+std::vector<uint8_t> PrefixAnnexBWithTiming(const std::vector<uint8_t>& annexB, int64_t capMs, int64_t sndMs)
+{
+    char head[80];
+    const int n = snprintf(head, sizeof(head), "{\"cap\":%lld,\"snd\":%lld}",
+                           static_cast<long long>(capMs), static_cast<long long>(sndMs));
+    if (n <= 0)
+        return annexB;
+    std::vector<uint8_t> out;
+    out.reserve(static_cast<size_t>(n) + annexB.size());
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(head),
+               reinterpret_cast<const uint8_t*>(head) + n);
+    out.insert(out.end(), annexB.begin(), annexB.end());
+    return out;
+}
+
+std::string MakePongMessage(double tEcho, int64_t mtMs)
+{
+    char buf[128];
+    // Echo t as a JSON number; mt is sender wall-clock ms (PROTOCOL 6.2 / 8.1).
+    snprintf(buf, sizeof(buf), "{\"type\":\"pong\",\"t\":%.0f,\"mt\":%lld}",
+             tEcho, static_cast<long long>(mtMs));
+    return std::string(buf);
+}
+
+std::string MakeSenderPingMessage()
+{
+    return std::string("{\"type\":\"ping\"}");
+}
+
+
 
 // usbmuxd cannot carry UDP (PROTOCOL 6.3). Loopback dials are the USB
 // binding on Windows when we add it; ignore cursorPort there.
@@ -235,46 +282,117 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     DesktopDuplication dup;
     InputInjector input;
     std::mutex pipelineMutex;
+    bool gpuNv12Path = false; // VideoProcessor BGRA->NV12 + EncodeDxgiNv12
+    bool haveGpuDesktopFrame = false; // true after first successful GPU present
 
     // Keeps this sender's monitor position separate from the other iPads' —
     // several senders share one HKCU key.
     vdisp.SetIdentity(ip);
 
+    // Prefer Intel-pinned MTT Virtual Display Driver when present so capture
+    // and QSV share a GPU (no Parsec adapter bounce). Fall back to Parsec VDD.
+    bool usingMttVdd = false;
+    bool mttModesEnsured = false; // once per connection; Ensure is idempotent too
+    ExistingMonitor mttMon{};
+    // Updated once the dial settles (USB vs Wi-Fi); buildPipeline / reconfigure read these.
+    EncodeKnobs sessionEncode;
+    EncodeMode sessionEncodeMode = EncodeMode::Dynamic;
+    EncodePreset sessionEncodePreset = EncodePreset::Speed;
+
     auto buildPipeline = [&](uint32_t width, uint32_t height) {
         // Caller holds pipelineMutex.
-        if (!vdisp.IsOpen() && !vdisp.Open()) {
-            Logf(ip, "VirtualDisplay::Open failed (parsec-vdd driver missing/inaccessible?)\n");
-            return false;
-        }
-        // Release the capture BEFORE touching the monitor. On a rotation rebuild
-        // EnsureResolution removes and re-adds the virtual display; doing that
-        // while a DXGI duplication is still live on the old output tears the
-        // monitor down under an active capture — which destabilizes DWM (the
-        // Display Settings dialog crashes) and can crash us. Closing first means
-        // no duplication ever references a monitor that's being replaced.
         dup.Close();
-        if (!vdisp.EnsureResolution(width, height, kFps)) {
-            Logf(ip, "VirtualDisplay::EnsureResolution failed (run as Administrator?)\n");
+
+        usingMttVdd = FindMttVirtualMonitor(mttMon);
+        if (usingMttVdd) {
+            Logf(ip, "using MTT virtual monitor %ls (%ls) - Intel-side VDD, skipping Parsec\n",
+                 mttMon.deviceName.c_str(), mttMon.deviceString.c_str());
+            // Merge hello + a few 16-aligned iPad modes into live MTT settings XML.
+            // Does not auto-switch the desktop mode - user picks in Display Settings.
+            if (!mttModesEnsured) {
+                EnsureMttResolutionsForHello(width, height, ip);
+                mttModesEnsured = true; // even on UAC decline: one prompt per connection
+            }
+            // Force hello WxH + landscape orientation so DXGI capture matches
+            // the iPad negotiation (portrait ModeDesc + landscape hello = sideways).
+            if (!EnsureMonitorMode(mttMon.deviceName, width, height, kFps)) {
+                Logf(ip, "MTT mode %ux%u@%u failed (keeping current)\n", width, height, kFps);
+                if (!EnsureMonitorRefresh(mttMon.deviceName, kFps))
+                    Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", kFps);
+                else
+                    Logf(ip, "MTT refresh set to %u Hz\n", kFps);
+            } else {
+                Logf(ip, "MTT mode set to %ux%u@%u (DMDO_DEFAULT)\n", width, height, kFps);
+            }
+            if (!dup.Open(mttMon.deviceName)) {
+                Logf(ip, "DesktopDuplication::Open failed on MTT device\n");
+                return false;
+            }
+            if (GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect))
+                input.SetMonitorRect(mttMon.rect);
+            else
+                input.SetMonitorRect(mttMon.rect);
+        } else {
+            if (!vdisp.IsOpen() && !vdisp.Open()) {
+                Logf(ip, "VirtualDisplay::Open failed (parsec-vdd driver missing/inaccessible?)\n");
+                return false;
+            }
+            // Release capture before EnsureResolution (Parsec path only): rotation
+            // rebuild tears down the virtual display under a live DXGI duplication
+            // and can crash DWM / Display Settings.
+            if (!vdisp.EnsureResolution(width, height, kFps)) {
+                Logf(ip, "VirtualDisplay::EnsureResolution failed (run as Administrator?)\n");
+                return false;
+            }
+            if (!dup.Open(vdisp.DeviceName())) {
+                Logf(ip, "DesktopDuplication::Open failed\n");
+                return false;
+            }
+            input.SetMonitorRect(vdisp.MonitorRect());
+        }
+        // Bind encoder here (not later on size-flip with HW disabled): QSV needs
+        // an Intel D3D device + SET_D3D_MANAGER before the first Configure.
+        // Prefer the capture device when it is Intel (MTT) so VideoProcessor
+        // NV12 and QSV share one D3D11 device — no CPU BGRA->NV12 bounce.
+        // Encode to the size the caller requested (capture WxH that triggered
+        // rebuild). Open() ModeDesc often stays hello landscape while DXGI
+        // frames are portrait after rotate - trusting ModeDesc flash-loops.
+        uint32_t encW = Align16Ceil(width);
+        uint32_t encH = Align16Ceil(height);
+        if (!encW || !encH) {
+            encW = Align16Ceil(dup.Width() ? dup.Width() : 1920);
+            encH = Align16Ceil(dup.Height() ? dup.Height() : 1080);
+        } else if (dup.Width() && dup.Height() &&
+                   (Align16Ceil(dup.Width()) != encW || Align16Ceil(dup.Height()) != encH)) {
+            Logf(ip, "Open ModeDesc %ux%u != requested encode %ux%u - using requested\n",
+                 dup.Width(), dup.Height(), encW, encH);
+        }
+        gpuNv12Path = false;
+        bool haveIntelD3d = false;
+        if (dup.Device() && dup.Context() && encoder.AdoptD3DDevice(dup.Device(), dup.Context()))
+            haveIntelD3d = true;
+        else if (encoder.EnsureIntelEncoderDevice())
+            haveIntelD3d = true;
+        if (!haveIntelD3d)
+            Logf(ip, "Intel encoder D3D device unavailable - HW encode may fall back\n");
+        encoder.SetAllowHardware(true);
+        if (!encoder.Configure(encW, encH, kFps, sessionEncode.peakBitrateBps,
+                               sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds,
+                               sessionEncode.useQualityRc, sessionEncode.rcQuality)) {
+            Logf(ip, "encoder Configure failed (%ux%u)\n", encW, encH);
             return false;
         }
-        if (!dup.Open(vdisp.DeviceName())) {
-            Logf(ip, "DesktopDuplication::Open failed\n");
-            return false;
+        // VBR only: Configure seeds mean ~60%; push preset mean (Speed/Balanced).
+        if (!sessionEncode.useQualityRc)
+            encoder.UpdateBitrate(sessionEncode.peakBitrateBps, sessionEncode.meanBitrateBps);
+        if (encoder.UsesDxgiInput() && encoder.D3DDevice() && encoder.D3DDevice() == dup.Device() &&
+            dup.EnsureGpuNv12Converter(encoder.Width(), encoder.Height())) {
+            gpuNv12Path = true;
+            Logf(ip, "GPU NV12 path active (VideoProcessor BGRA->NV12 on capture/QSV device)\n");
+            haveGpuDesktopFrame = false;
+        } else if (encoder.UsesDxgiInput()) {
+            Logf(ip, "DXGI NV12 encode ready; GPU convert unbound - CPU BGRA->NV12 fallback\n");
         }
-        const uint32_t encW = Align16Ceil(dup.Width());
-        const uint32_t encH = Align16Ceil(dup.Height());
-        if (encW == 0 || encH == 0) {
-            Logf(ip, "encoder size align failed (dup %ux%u)\n", dup.Width(), dup.Height());
-            return false;
-        }
-        if (encW != dup.Width() || encH != dup.Height())
-            Logf(ip, "encode size %ux%u (capture %ux%u, 16-ceil pad)\n",
-                 encW, encH, dup.Width(), dup.Height());
-        if (!encoder.Configure(encW, encH, kFps, kBitrateBps)) {
-            Logf(ip, "encoder configure failed\n");
-            return false;
-        }
-        input.SetMonitorRect(vdisp.MonitorRect());
         {
             const std::wstring mftW = encoder.MftName();
             std::string mft;
@@ -283,8 +401,17 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 mft.push_back(c >= 32 && c < 127 ? static_cast<char>(c) : '?');
             if (mft.empty())
                 mft = "(unknown)";
-            Logf(ip, "pipeline ready: %ux%u @ %u fps / VBR peak %u kbps, MFT: %s\n",
-                 encoder.Width(), encoder.Height(), kFps, kBitrateBps / 1000, mft.c_str());
+            if (sessionEncode.useQualityRc) {
+                Logf(ip, "pipeline ready: %ux%u @ %u fps / Quality RC q=%u QVs=%u GOP=%us (soft max %u kbps), MFT: %s\n",
+                     encoder.Width(), encoder.Height(), kFps, sessionEncode.rcQuality,
+                     sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds,
+                     sessionEncode.peakBitrateBps / 1000, mft.c_str());
+            } else {
+                Logf(ip, "pipeline ready: %ux%u @ %u fps / VBR peak %u kbps mean %u kbps QVs=%u GOP=%us, MFT: %s\n",
+                     encoder.Width(), encoder.Height(), kFps, sessionEncode.peakBitrateBps / 1000,
+                     sessionEncode.meanBitrateBps / 1000, sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds,
+                     mft.c_str());
+            }
         }
         return true;
     };
@@ -315,15 +442,47 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // nothing about its situation changed.
         if (state_ != State::Blocked)
             state_ = State::Connecting;
-        Logf(ip, "connecting to port %u ...\n", port);
-        auto conn = Connection::Connect(ip, port);
+
+        // USB preferred only while usbmux + a USB device are available.
+        // Configured Wi-Fi IP stays the fallback target (never removed).
+        bool usbSession = false;
+        std::optional<Connection> conn;
+        UsbMuxDevice usbDev{};
+        const bool configuredLoopback = IsUsbLikeHost(ip);
+        if (!configuredLoopback && ProbeUsbMux(usbDev) && usbDev.present) {
+            Logf(ip, "USB usbmux device %s, preferring 127.0.0.1:%u over Wi-Fi %s:%u\n",
+                 usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), kUsbMuxLocalPort,
+                 ip.c_str(), port);
+            if (EnsureUsbMuxForward(port, kUsbMuxLocalPort))
+                conn = Connection::Connect("127.0.0.1", kUsbMuxLocalPort);
+            if (!conn) {
+                auto sock = ConnectUsbMux(usbDev.deviceId, port);
+                if (sock)
+                    conn = Connection::FromSocket(*sock);
+            }
+            if (conn) {
+                usbSession = true;
+                Logf(ip, "connected via USB (usbmux localhost:%u -> iPad:%u)\n",
+                     kUsbMuxLocalPort, port);
+            } else {
+                Logf(ip, "USB usbmux dial failed, falling back to Wi-Fi %s:%u\n",
+                     ip.c_str(), port);
+            }
+        }
+        if (!conn) {
+            Logf(ip, "connecting to %s:%u ...\n", ip.c_str(), port);
+            conn = Connection::Connect(ip, port);
+        }
         if (!conn) {
             Logf(ip, "connect failed, retrying in %dms\n", kReconnectDelayMs);
             InterruptibleSleep(kReconnectDelayMs);
             continue;
         }
         ActiveConn activeConn(this, &*conn);
-        Logf(ip, "connected, waiting for hello...\n");
+        if (!usbSession)
+            Logf(ip, "connected via Wi-Fi, waiting for hello...\n");
+        else
+            Logf(ip, "USB path waiting for hello...\n");
 
         HelloMsg hello;
         bool gotHello = false;
@@ -370,8 +529,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             // seconds for as long as the other iPad streams.
             if (!blockedLogged) {
                 blockedLogged = true;
-                Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u — parsec-vdd only "
-                         "holds one custom resolution at a time\n",
+                Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u - only one "
+                         "panel size at a time (Parsec shares one custom mode; MTT keeps sizes serialized)\n",
                      activeWidth, activeHeight, width, height);
             }
             conn->Close();
@@ -381,6 +540,26 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         blockedByWidth_ = 0;
         blockedByHeight_ = 0;
         blockedLogged = false;
+
+        {
+            // Reload prefs each connect so Settings changes apply without a full restart.
+            const Config cfg = Config::Load();
+            sessionEncodeMode = ParseEncodeMode(usbSession ? cfg.usbEncodeMode : cfg.wifiEncodeMode);
+            sessionEncodePreset = ParseEncodePreset(usbSession ? cfg.usbEncodePreset : cfg.wifiEncodePreset);
+            sessionEncode = ResolveEncodeKnobs(usbSession, sessionEncodeMode, sessionEncodePreset);
+            if (sessionEncode.useQualityRc) {
+                Logf(ip, "%s encode profile: mode=%s preset=%s QualityRC q=%u QVs=%u GOP=%us\n",
+                     usbSession ? "USB" : "Wi-Fi",
+                     EncodeModeName(sessionEncodeMode), EncodePresetName(sessionEncodePreset),
+                     sessionEncode.rcQuality, sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds);
+            } else {
+                Logf(ip, "%s encode profile: mode=%s preset=%s peak=%u kbps QVs=%u GOP=%us\n",
+                     usbSession ? "USB" : "Wi-Fi",
+                     EncodeModeName(sessionEncodeMode), EncodePresetName(sessionEncodePreset),
+                     sessionEncode.peakBitrateBps / 1000, sessionEncode.qualityVsSpeed,
+                     sessionEncode.gopSeconds);
+            }
+        }
 
         bool pipelineOk;
         {
@@ -410,7 +589,14 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         std::chrono::steady_clock::time_point cursorUdpOpened{};
         bool cursorUdpGaveUp = false;
 
-        std::thread reader([&] {
+                // Receiver ping → pong (PROTOCOL 8.1). Reader must not write the
+        // socket (interleaves with video); queue t values for the capture loop.
+        std::mutex pongMutex;
+        std::vector<double> pendingPongTs;
+        auto lastSenderPing = std::chrono::steady_clock::now();
+        constexpr int kSenderPingMs = 2000;
+
+std::thread reader([&] {
             while (running && !stopRequested_) {
                 auto frame = conn->ReadFrame();
                 if (!frame) {
@@ -428,37 +614,22 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         Logf(ip, "kf requested by receiver\n");
                         encoder.RequestKeyFrame();
                         break;
+                    case ControlType::Ping: {
+                        std::lock_guard<std::mutex> plock(pongMutex);
+                        pendingPongTs.push_back(msg->ping.t);
+                        break;
+                    }
                     case ControlType::Hello: {
-                        // Rotation (or any panel-size change): rebuild the
-                        // whole pipeline for the new dimensions. Everything
-                        // that reads or writes `width`/`height` does so under
-                        // pipelineMutex — the capture loop compares the
-                        // monitor against them (see the panel-size watchdog).
+                        // Rotation / panel-size change: rebuild. Same-size hello
+                        // again (common right after connect) must not tear down
+                        // capture+encoder under live input - that flash+crash.
                         std::lock_guard<std::mutex> lock(pipelineMutex);
                         uint32_t w = Align16Clamp(msg->hello.pixelsWide, width);
                         uint32_t h = Align16Clamp(msg->hello.pixelsHigh, height);
-                        Logf(ip, "hello again: %dx%d -> rebuilding pipeline at %ux%u\n", msg->hello.pixelsWide,
-                               msg->hello.pixelsHigh, w, h);
-                        // Turning the iPad changes the size under the claim.
-                        // Alone that's fine; with another iPad attached the two
-                        // would be back to fighting over the one custom
-                        // resolution the driver has, so say so and carry on —
-                        // hanging up on the user for turning their iPad would
-                        // be worse.
-                        if (!RetunePanel(w, h))
-                            Logf(ip, "rotating while another iPad is attached — its picture may end up "
-                                     "letterboxed until one of you reconnects\n");
-
-                        if (buildPipeline(w, h)) {
-                            width = w;
-                            height = h;
-                            width_ = w;
-                            height_ = h;
-                            // Rotation hello may re-advertise cursorPort; keep the
-                            // flow if the port is unchanged (Mac sender does this).
-                            const int port = msg->hello.cursorPort;
+                        const int port = msg->hello.cursorPort;
+                        auto retuneCursor = [&]() {
                             std::lock_guard<std::mutex> clock(cursorNetMutex);
-                            if (port > 0 && port <= 65535 && !IsUsbLikeHost(ip)) {
+                            if (port > 0 && port <= 65535 && !(usbSession || IsUsbLikeHost(ip))) {
                                 if (!cursorUdp.Ready()) {
                                     if (cursorUdp.Open(ip, static_cast<uint16_t>(port))) {
                                         cursorUdpConfirmed = false;
@@ -471,6 +642,31 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                                 cursorUdp.Close();
                                 cursorUdpConfirmed = false;
                             }
+                        };
+                        if (w == width && h == height) {
+                            Logf(ip, "hello again: %dx%d -> size unchanged, keeping pipeline\n",
+                                 msg->hello.pixelsWide, msg->hello.pixelsHigh);
+                            retuneCursor();
+                            break;
+                        }
+                        Logf(ip, "hello again: %dx%d -> rebuilding pipeline at %ux%u\n", msg->hello.pixelsWide,
+                               msg->hello.pixelsHigh, w, h);
+                        // Turning the iPad changes the size under the claim.
+                        // Alone that's fine; with another iPad attached the two
+                        // would be back to fighting over the one custom
+                        // resolution the driver has, so say so and carry on -
+                        // hanging up on the user for turning their iPad would
+                        // be worse.
+                        if (!RetunePanel(w, h))
+                            Logf(ip, "rotating while another iPad is attached - its picture may end up "
+                                     "letterboxed until one of you reconnects\n");
+
+                        if (buildPipeline(w, h)) {
+                            width = w;
+                            height = h;
+                            width_ = w;
+                            height_ = h;
+                            retuneCursor();
                         } else {
                             Logf(ip, "pipeline rebuild failed, disconnecting\n");
                             running = false;
@@ -537,6 +733,9 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // A drop is "pending" until something goes out again. Guards the replay
         // below against re-arming itself on every failed attempt.
         bool dropPending = false;
+        auto lastBackpressure = std::chrono::steady_clock::now() - std::chrono::hours(1);
+        auto lastDynamicAdjust = std::chrono::steady_clock::now() - std::chrono::hours(1);
+        auto lastDynamicLog = std::chrono::steady_clock::now() - std::chrono::hours(1);
         // Set when the monitor rect couldn't be read right after a geometry
         // change (the desktop can still be mid-reconfigure); retried below
         // until it succeeds, because nothing else refreshes it in place.
@@ -548,7 +747,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
         // WiFi only: dial hello.cursorPort on the same host as TCP.
         std::string cursorProbe;
-        if (hello.cursorPort > 0 && hello.cursorPort <= 65535 && !IsUsbLikeHost(ip)) {
+        if (hello.cursorPort > 0 && hello.cursorPort <= 65535 && !(usbSession || IsUsbLikeHost(ip))) {
             std::lock_guard<std::mutex> lock(cursorNetMutex);
             if (cursorUdp.Open(ip, static_cast<uint16_t>(hello.cursorPort))) {
                 cursorUdpOpened = std::chrono::steady_clock::now();
@@ -563,7 +762,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             } else {
                 Logf(ip, "cursor UDP open failed for port %d, staying on TCP\n", hello.cursorPort);
             }
-        } else if (hello.cursorPort > 0 && IsUsbLikeHost(ip)) {
+        } else if (hello.cursorPort > 0 && (usbSession || IsUsbLikeHost(ip))) {
             Logf(ip, "ignoring cursorPort=%d on USB-like host\n", hello.cursorPort);
         }
         if (!cursorProbe.empty()) {
@@ -577,9 +776,22 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
         bool sizeGiveUpLogged = false;
+        std::chrono::steady_clock::time_point waitFirstFrameSince{};
+        bool firstFrameNudged = false;
+        bool firstFrameWaitLogged = false;
+        std::chrono::steady_clock::time_point lastEncSizeRebuild{};
+        std::chrono::steady_clock::time_point lastPadFailLog{};
+        // Local cadence: presents / encode-calls / AUs / sends per window.
+        std::chrono::steady_clock::time_point cadenceSince = std::chrono::steady_clock::now();
+        uint32_t cadencePresents = 0;
+        uint32_t cadenceEncCalls = 0;
+        uint32_t cadenceAus = 0;
+        uint32_t cadenceSends = 0;
+        uint32_t cadenceTimeouts = 0;
 
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
+            int64_t capMs = 0;
             {
                 // Only capture+encode need the pipeline lock (they touch dup
                 // and encoder, which the reader thread may rebuild on
@@ -589,11 +801,93 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // reader thread) — this loop holds it almost continuously.
                 std::lock_guard<std::mutex> lock(pipelineMutex);
 
-                nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
                 // CaptureResult: desktopChanged drives encode; cursor*
                 // go out as separate protocol messages (not baked into H.264).
-                CaptureResult cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                capMs = UnixEpochMs();
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuNv12;
+                CaptureResult cap{};
+                if (gpuNv12Path) {
+                    cap = dup.CaptureFrameNv12Gpu(gpuNv12, encoder.Width(), encoder.Height(),
+                                                  1000 / static_cast<int>(kFps));
+                    if (cap.desktopChanged && !gpuNv12) {
+                        // VP convert failed mid-stream - drop to CPU for this process.
+                        Logf(ip, "GPU NV12 capture failed - falling back to CPU BGRA->NV12\n");
+                        gpuNv12Path = false;
+                        haveGpuDesktopFrame = false;
+                        nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
+                        cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                    } else if (cap.desktopChanged && gpuNv12 && !haveGpuDesktopFrame) {
+                        // First real present after connect/rebuild: IDR so the iPad
+                        // leaves its black decoder state immediately.
+                        haveGpuDesktopFrame = true;
+                        waitFirstFrameSince = {};
+                        firstFrameNudged = false;
+                        firstFrameWaitLogged = false;
+                        encoder.RequestKeyFrame();
+                        Logf(ip, "first GPU desktop frame - keyframe requested\n");
+                    }
+                } else {
+                    nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
+                    cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                }
                 const bool changed = cap.desktopChanged;
+                if (changed)
+                    ++cadencePresents;
+                else if (!cap.acquired)
+                    ++cadenceTimeouts;
+
+                {
+                    const auto nowCad = std::chrono::steady_clock::now();
+                    if (nowCad - cadenceSince >= std::chrono::milliseconds(2000)) {
+                        const double sec = std::chrono::duration<double>(nowCad - cadenceSince).count();
+                        if (sec > 0.1) {
+                            Logf(ip,
+                                 "cadence: present=%.1f/s enc=%.1f/s au=%.1f/s send=%.1f/s timeout=%.1f/s\n",
+                                 cadencePresents / sec, cadenceEncCalls / sec, cadenceAus / sec,
+                                 cadenceSends / sec, cadenceTimeouts / sec);
+                        }
+                        cadenceSince = nowCad;
+                        cadencePresents = cadenceEncCalls = cadenceAus = cadenceSends = cadenceTimeouts = 0;
+                    }
+                }
+
+                // Mode change / ACCESS_LOST: Reopen() made a fresh D3D device.
+                // The HW MFT is still bound to the old one - keep feeding it and
+                // ProcessInput E_FAIL freezes the iPad. Rebuild capture+encoder.
+                if (cap.accessLost) {
+                    Logf(ip, "capture ACCESS_LOST - rebuilding pipeline (new D3D device)\n");
+                    haveGpuDesktopFrame = false;
+                    gpuNv12Path = false;
+                    waitFirstFrameSince = {};
+                    firstFrameNudged = false;
+                    firstFrameWaitLogged = false;
+                    if (!buildPipeline(width, height)) {
+                        Logf(ip, "pipeline rebuild after ACCESS_LOST failed, dropping the connection\n");
+                        running = false;
+                    }
+                    continue;
+                }
+
+                // MTT/VDD often never presents after DuplicateOutput until
+                // something dirties the output - without that we sit on black
+                // (no first GPU frame / no keepalive texture).
+                if (gpuNv12Path && !haveGpuDesktopFrame) {
+                    const auto nowWait = std::chrono::steady_clock::now();
+                    if (waitFirstFrameSince == std::chrono::steady_clock::time_point{})
+                        waitFirstFrameSince = nowWait;
+                    const auto waited = nowWait - waitFirstFrameSince;
+                    if (!firstFrameNudged &&
+                        waited > std::chrono::milliseconds(300)) {
+                        dup.NudgePresent();
+                        firstFrameNudged = true;
+                        Logf(ip, "no desktop present yet - nudged MTT/output for first frame\n");
+                    } else if (!firstFrameWaitLogged &&
+                               waited > std::chrono::milliseconds(2000)) {
+                        dup.NudgePresent();
+                        firstFrameWaitLogged = true;
+                        Logf(ip, "still waiting for first GPU desktop present after nudge\n");
+                    }
+                }
 
                 pendingCursorImg.clear();
                 pendingCursor.clear();
@@ -627,21 +921,62 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // skewed frame, exactly what this is here to prevent.
                 const uint32_t wantW = Align16Ceil(dup.Width());
                 const uint32_t wantH = Align16Ceil(dup.Height());
-                if (changed && (encoder.Width() != wantW || encoder.Height() != wantH)) {
-                    Logf(ip, "capture is now %ux%u (encoder had %ux%u), reconfiguring\n", dup.Width(), dup.Height(),
-                           encoder.Width(), encoder.Height());
-                    encoder.SetAllowHardware(false); // size flip: keep software, skip QSV probe walk
-                    if (encoder.Configure(wantW, wantH, kFps, kBitrateBps)) {
-                        // The cached rect is only refreshed when the monitor
-                        // moves, and a rotation in place doesn't move it.
-                        rectStale = !vdisp.QueryMonitorRect();
-                        input.SetMonitorRect(vdisp.MonitorRect());
-                        encoder.RequestKeyFrame();
+                // Capture/encoder WxH mismatch (incl. portrait swap). Require a
+                // real desktop frame so Open() ModeDesc alone cannot fight the
+                // encode size we just forced (that was the quick-flash loop).
+                // Idle presents keep last frame size on dup, so pad-fail
+                // mismatch still rebuilds without needing a fresh present.
+                if (wantW && wantH && dup.HaveDesktopFrame() &&
+                    (encoder.Width() != wantW || encoder.Height() != wantH)) {
+                    const auto nowSz = std::chrono::steady_clock::now();
+                    if (lastEncSizeRebuild != std::chrono::steady_clock::time_point{} &&
+                        nowSz - lastEncSizeRebuild < std::chrono::milliseconds(250)) {
+                        continue; // avoid rebuild thrash mid-flip
+                    }
+                    lastEncSizeRebuild = nowSz;
+                    // Full rebuild (not Configure-in-place). If capture is the
+                    // hello size swapped (portrait DXGI vs landscape hello),
+                    // force MTT back to hello landscape and encode hello WxH -
+                    // encoding portrait "fixes" flash but the iPad stays sideways.
+                    Logf(ip, "capture is now %ux%u (encoder had %ux%u), rebuilding pipeline\n", dup.Width(),
+                         dup.Height(), encoder.Width(), encoder.Height());
+                    haveGpuDesktopFrame = false;
+                    gpuNv12Path = false;
+                    waitFirstFrameSince = {};
+                    firstFrameNudged = false;
+                    firstFrameWaitLogged = false;
+                    const bool swappedHello = (wantW == height && wantH == width);
+                    uint32_t rebuildW = wantW;
+                    uint32_t rebuildH = wantH;
+                    if (swappedHello) {
+                        rebuildW = width;
+                        rebuildH = height;
+                        if (usingMttVdd) {
+                            if (EnsureMonitorMode(mttMon.deviceName, rebuildW, rebuildH, kFps))
+                                Logf(ip, "capture was portrait swap of hello - forced MTT %ux%u landscape\n",
+                                     rebuildW, rebuildH);
+                            else
+                                Logf(ip, "capture was portrait swap of hello - MTT mode force failed\n");
+                        }
+                    } else {
+                        width = wantW;
+                        height = wantH;
+                    }
+                    if (!buildPipeline(rebuildW, rebuildH)) {
+                        Logf(ip, "pipeline rebuild after resize failed, dropping the connection\n");
+                        running = false;
+                    } else {
                         width_ = dup.Width();
                         height_ = dup.Height();
-                    } else {
-                        Logf(ip, "encoder reconfigure failed, dropping the connection\n");
-                        running = false;
+                        if (usingMttVdd) {
+                            if (GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect))
+                                input.SetMonitorRect(mttMon.rect);
+                            rectStale = false;
+                        } else {
+                            rectStale = !vdisp.QueryMonitorRect();
+                            input.SetMonitorRect(vdisp.MonitorRect());
+                        }
+                        continue; // capture a fresh frame on the new pipeline
                     }
                 } else if (rectStale && vdisp.QueryMonitorRect()) {
                     // The desktop was still mid-reconfigure above. Without this
@@ -665,7 +1000,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // Only when the size is neither the panel's nor the panel
                 // rotated: a rotation made in Windows is the user's decision
                 // and is adopted, not undone.
-                if (dup.Width() == height && dup.Height() == width) {
+                // Only adopt rotation into session size from a real frame - not
+                // Open() ModeDesc, which can disagree with DXGI buffer orientation.
+                if (changed && dup.HaveDesktopFrame() &&
+                    dup.Width() == height && dup.Height() == width) {
                     std::swap(width, height); // rotated in Windows: that is the panel size now
                 }
                 // Exactly one attempt, and only after the churn has settled. A
@@ -686,23 +1024,40 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                     // re-applying the mode on the live monitor is refused
                     // (DISP_CHANGE_BADMODE) while the capture runs.
                     sizeRebuildDone = true;
-                    Logf(ip, "monitor sits at %ux%u instead of %ux%u, rebuilding once\n", dup.Width(), dup.Height(),
-                         width, height);
-                    if (!buildPipeline(width, height))
-                        Logf(ip, "rebuild for the panel size failed, keeping what we have\n");
-                    else
-                        continue; // nv12 still holds the pre-rebuild frame — capture a fresh one
+                    if (usingMttVdd) {
+                        // MTT: do not rebuild to ModeDesc - fights capture-driven encode WxH.
+                        Logf(ip, "monitor sits at %ux%u (session %ux%u) - MTT: not forcing ModeDesc rebuild\n",
+                             dup.Width(), dup.Height(), width, height);
+                    } else {
+                        Logf(ip, "monitor sits at %ux%u instead of %ux%u, rebuilding once to capture size\n",
+                             dup.Width(), dup.Height(), width, height);
+                        const uint32_t capW = Align16Ceil(dup.Width());
+                        const uint32_t capH = Align16Ceil(dup.Height());
+                        if (capW && capH) {
+                            width = capW;
+                            height = capH;
+                        }
+                        if (!buildPipeline(width, height))
+                            Logf(ip, "rebuild for the panel size failed, keeping what we have\n");
+                        else
+                            continue; // nv12 still holds the pre-rebuild frame
+                    }
                 } else if (sizeRebuildDone && !sizeGiveUpLogged) {
-                    // parsec-vdd puts *one* custom resolution on all of its
-                    // virtual monitors: whichever sender sets its panel size
-                    // last drags every other monitor along. Two iPads with
-                    // different panels therefore can't both run native, and
-                    // the smaller one shows the picture letterboxed. Said once
-                    // per connection, then we stop touching the monitor.
+                    // Parsec: one custom mode on every virtual monitor - another
+                    // sender's size wins and this panel letterboxes. MTT: modes
+                    // are independent; a mismatch usually means Display Settings
+                    // is on a non-native size (e.g. 16:9 on a 3:2 iPad) - pick
+                    // the hello size on the MTT monitor. Said once per connection.
                     sizeGiveUpLogged = true;
-                    Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): parsec-vdd shares one custom resolution "
-                             "across all its monitors, so the picture stays letterboxed here\n",
-                         dup.Width(), dup.Height(), width, height);
+                    if (usingMttVdd) {
+                        Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): pick %ux%u on the MTT monitor in "
+                                 "Display Settings - letterboxing means the desktop aspect doesn't match the panel\n",
+                             dup.Width(), dup.Height(), width, height, width, height);
+                    } else {
+                        Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): parsec-vdd shares one custom resolution "
+                                 "across all its monitors, so the picture stays letterboxed here\n",
+                             dup.Width(), dup.Height(), width, height);
+                    }
                 }
 
                 if (changed)
@@ -718,28 +1073,48 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // low-latency.
                 bool active = now - lastChange < std::chrono::milliseconds(kActiveTailMs);
 
-                // Keepalive re-encodes the last image (a tiny P-frame) purely
-                // so the iPad's ~5s liveness watchdog (spec §5) never trips on
-                // an otherwise idle desktop. Not gated on "captured a real
-                // frame yet": if the first DXGI frame is delayed past the
-                // watchdog, this still sends the (zero-filled) buffer so the
-                // connection survives until real content arrives.
+                // Keepalive re-encodes the last image (a tiny P-frame) so the
+                // iPad's ~5s liveness watchdog (spec §5) never trips on an
+                // otherwise idle desktop. GPU path only encodes once we have a
+                // real present (CaptureFrameNv12Gpu returns null until then);
+                // do not fall through to an empty CPU buffer.
                 bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
 
                 if (running && (active || keepaliveDue)) {
-                    std::vector<uint8_t> encNv12;
-                    if (!PadNv12TopLeft(nv12, dup.Width(), dup.Height(),
-                                         encoder.Width(), encoder.Height(), encNv12)) {
-                        Logf(ip, "nv12 pad failed (cap %ux%u -> enc %ux%u)\n",
-                             dup.Width(), dup.Height(), encoder.Width(), encoder.Height());
-                        continue;
+                    if (gpuNv12Path) {
+                        // last-good texture from CaptureFrameNv12Gpu (or null
+                        // before the first present / after Open reset).
+                        if (gpuNv12) {
+                            encoded = encoder.EncodeDxgiNv12(gpuNv12.Get());
+                            ++cadenceEncCalls;
+                            cadenceAus += static_cast<uint32_t>(encoded.size());
+                        }
+                    } else {
+                        std::vector<uint8_t> encNv12;
+                        if (!PadNv12TopLeft(nv12, dup.Width(), dup.Height(),
+                                             encoder.Width(), encoder.Height(), encNv12)) {
+                            const auto nowPad = std::chrono::steady_clock::now();
+                            if (lastPadFailLog == std::chrono::steady_clock::time_point{} ||
+                                nowPad - lastPadFailLog > std::chrono::milliseconds(2000)) {
+                                lastPadFailLog = nowPad;
+                                Logf(ip, "nv12 pad failed (cap %ux%u -> enc %ux%u)\n",
+                                     dup.Width(), dup.Height(), encoder.Width(), encoder.Height());
+                            }
+                            continue;
+                        }
+                        encoded = encoder.EncodeNv12(encNv12.data(), encNv12.size());
+                        ++cadenceEncCalls;
+                        cadenceAus += static_cast<uint32_t>(encoded.size());
                     }
-                    encoded = encoder.EncodeNv12(encNv12.data(), encNv12.size());
                     if (encoder.ConsecutiveAsyncTimeouts() >= 3) {
                         Logf(ip, "async encoder stalled (%d timeouts) - falling back to software\n",
                              encoder.ConsecutiveAsyncTimeouts());
+                        gpuNv12Path = false;
                         encoder.SetAllowHardware(false);
-                        if (!encoder.Configure(encoder.Width(), encoder.Height(), kFps, kBitrateBps)) {
+                        if (!encoder.Configure(encoder.Width(), encoder.Height(), kFps,
+                                               sessionEncode.peakBitrateBps, sessionEncode.qualityVsSpeed,
+                                               sessionEncode.gopSeconds, sessionEncode.useQualityRc,
+                                               sessionEncode.rcQuality)) {
                             Logf(ip, "software encoder fallback failed\n");
                         } else {
                             const std::wstring mft = encoder.MftName();
@@ -793,6 +1168,56 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             }
 
             bool sentSomething = false;
+            // Reply to receiver ping(s) before video so clock offset stays fresh.
+            {
+                std::vector<double> toPong;
+                {
+                    std::lock_guard<std::mutex> plock(pongMutex);
+                    toPong.swap(pendingPongTs);
+                }
+                for (double tEcho : toPong) {
+                    const std::string pong = MakePongMessage(tEcho, UnixEpochMs());
+                    if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(pong.data()),
+                                         static_cast<uint32_t>(pong.size()))) {
+                        running = false;
+                        break;
+                    }
+                }
+            }
+            // Sender liveness ping every ~2s (PROTOCOL 8.2).
+            if (running) {
+                const auto nowPing = std::chrono::steady_clock::now();
+                if (nowPing - lastSenderPing >= std::chrono::milliseconds(kSenderPingMs)) {
+                    lastSenderPing = nowPing;
+                    const std::string ping = MakeSenderPingMessage();
+                    if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(ping.data()),
+                                         static_cast<uint32_t>(ping.size()))) {
+                        running = false;
+                    }
+                }
+            }
+
+            // Dynamic: after a healthy stretch, step peak back toward the ceiling.
+            // Never touches QualityVsSpeed (stays at the session preset value).
+            if (sessionEncodeMode == EncodeMode::Dynamic &&
+                sessionEncode.peakBitrateBps < sessionEncode.ceilingPeakBps) {
+                const auto nowHealthy = std::chrono::steady_clock::now();
+                if (nowHealthy - lastBackpressure >= std::chrono::milliseconds(kDynamicHealthyMs) &&
+                    nowHealthy - lastDynamicAdjust >= std::chrono::milliseconds(kDynamicHealthyMs)) {
+                    if (StepDynamicPeak(sessionEncode, /*congested=*/false)) {
+                        if (encoder.UpdateBitrate(sessionEncode.peakBitrateBps,
+                                                  sessionEncode.meanBitrateBps)) {
+                            encoder.RequestKeyFrame();
+                            if (nowHealthy - lastDynamicLog >= std::chrono::milliseconds(kDynamicLogMinMs)) {
+                                lastDynamicLog = nowHealthy;
+                                Logf(ip, "Dynamic encode: peak -> %u kbps (healthy)\n",
+                                     sessionEncode.peakBitrateBps / 1000);
+                            }
+                        }
+                        lastDynamicAdjust = nowHealthy;
+                    }
+                }
+            }
             for (auto& f : encoded) {
                 // Backpressure: if the socket can't take data within the
                 // budget, drop the whole frame (never a partial write — that
@@ -822,9 +1247,27 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         // loudest line in the log.
                         Logf(ip, "send backpressure, dropped a frame\n");
                     }
+                    lastBackpressure = std::chrono::steady_clock::now();
+                    if (sessionEncodeMode == EncodeMode::Dynamic) {
+                        if (StepDynamicPeak(sessionEncode, /*congested=*/true)) {
+                            if (encoder.UpdateBitrate(sessionEncode.peakBitrateBps,
+                                                      sessionEncode.meanBitrateBps)) {
+                                encoder.RequestKeyFrame();
+                                const auto nowAdj = std::chrono::steady_clock::now();
+                                if (nowAdj - lastDynamicLog >= std::chrono::milliseconds(kDynamicLogMinMs)) {
+                                    lastDynamicLog = nowAdj;
+                                    Logf(ip, "Dynamic encode: peak -> %u kbps (backpressure)\n",
+                                         sessionEncode.peakBitrateBps / 1000);
+                                }
+                            }
+                            lastDynamicAdjust = std::chrono::steady_clock::now();
+                        }
+                    }
                     break;
                 }
-                if (!conn->SendFrame(f.annexB.data(), static_cast<uint32_t>(f.annexB.size()))) {
+                const int64_t sndMs = UnixEpochMs();
+                std::vector<uint8_t> wire = PrefixAnnexBWithTiming(f.annexB, capMs, sndMs);
+                if (!conn->SendFrame(wire.data(), static_cast<uint32_t>(wire.size()))) {
                     // A real send error (blocking send, so not a timeout):
                     // the connection is gone. Drop it and let the outer loop
                     // reconnect + resync with a fresh hello and keyframe.
@@ -836,8 +1279,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 if (f.isKeyFrame)
                     Logf(ip, "sent keyframe, %zu bytes\n", f.annexB.size());
             }
-            if (sentSomething)
+            if (sentSomething) {
+                ++cadenceSends;
                 lastSend = std::chrono::steady_clock::now();
+            }
         }
 
         conn->Close();
@@ -855,3 +1300,4 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 }
 
 } // namespace od
+

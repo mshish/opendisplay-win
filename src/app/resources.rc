@@ -6,20 +6,36 @@
 // the dialog.
 #pragma code_page(65001)
 
-IDD_SETTINGS DIALOGEX 0, 0, 230, 203
+IDD_SETTINGS DIALOGEX 0, 0, 260, 292
 STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "opendisplay-win - Settings"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "One iPad per line, address first, then a name of your choosing:", -1, 10, 8, 210, 10
-    EDITTEXT        IDC_IP, 10, 20, 210, 48, ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | WS_VSCROLL
-    LTEXT           "e.g. 192.168.1.42 Mini — the name is only for the tray menu.", -1, 10, 71, 210, 10
-    LTEXT           "Port:", -1, 10, 86, 40, 10
-    EDITTEXT        IDC_PORT, 55, 84, 55, 13, ES_AUTOHSCROLL | ES_NUMBER
-    AUTOCHECKBOX    "Connect to the iPads automatically when running", IDC_AUTORECONNECT, 10, 104, 210, 10
-    AUTOCHECKBOX    "Start with Windows (launch at logon)", IDC_AUTOSTART, 10, 118, 210, 10
+    LTEXT           "One iPad per line, address first, then a name of your choosing:", -1, 10, 8, 240, 10
+    EDITTEXT        IDC_IP, 10, 20, 240, 40, ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | WS_VSCROLL
+    LTEXT           "e.g. 192.168.1.42 Mini - the name is only for the tray menu.", -1, 10, 63, 240, 10
+    LTEXT           "Port:", -1, 10, 78, 40, 10
+    EDITTEXT        IDC_PORT, 55, 76, 55, 13, ES_AUTOHSCROLL | ES_NUMBER
+    AUTOCHECKBOX    "Connect to the iPads automatically when running", IDC_AUTORECONNECT, 10, 96, 240, 10
+    AUTOCHECKBOX    "Start with Windows (launch at logon)", IDC_AUTOSTART, 10, 110, 240, 10
+
+    LTEXT           "USB encoding", -1, 10, 130, 100, 10
+    LTEXT           "Mode:", -1, 10, 146, 32, 10
+    COMBOBOX        IDC_USB_ENCODE_MODE, 44, 144, 70, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Preset:", -1, 124, 146, 36, 10
+    COMBOBOX        IDC_USB_ENCODE_PRESET, 162, 144, 88, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Wi-Fi encoding", -1, 10, 166, 100, 10
+    LTEXT           "Mode:", -1, 10, 182, 32, 10
+    COMBOBOX        IDC_WIFI_ENCODE_MODE, 44, 180, 70, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Preset:", -1, 124, 182, 36, 10
+    COMBOBOX        IDC_WIFI_ENCODE_PRESET, 162, 180, 88, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Dynamic adjusts bitrate to the link; Fixed locks a preset. Preset is also the Dynamic ceiling/base. Speed favors latency (QualityVsSpeed=0).",
+                    -1, 10, 200, 240, 28
+
     LTEXT           "Runs without admin. Admin is only needed once, to register a new iPad's resolution (you'll get a UAC prompt on first connect). ""Run as administrator"" from the tray menu also lets touch control elevated windows.",
-                    -1, 10, 136, 210, 44
-    DEFPUSHBUTTON   "OK", IDOK, 116, 182, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 170, 182, 50, 15
+                    -1, 10, 232, 240, 36
+    DEFPUSHBUTTON   "OK", IDOK, 146, 272, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 200, 272, 50, 15
 END

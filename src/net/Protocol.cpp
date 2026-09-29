@@ -163,8 +163,11 @@ std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t si
         msg.type = ControlType::CursorAck;
     } else if (*type == "stats") {
         msg.type = ControlType::Stats;
+    } else if (*type == "ping") {
+        msg.type = ControlType::Ping;
+        msg.ping.t = FindNumberField(json, "t").value_or(0.0);
     } else {
-        msg.type = ControlType::Unknown; // e.g. "stats", "pong" -> ignored by caller
+        msg.type = ControlType::Unknown; // e.g. sender ignores receiver "pong"
     }
 
     return msg;

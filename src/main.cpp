@@ -13,6 +13,7 @@
 #include "app/SenderApp.h"
 #include "app/TrayApp.h"
 #include "display/VirtualDisplay.h"
+#include "display/MttVddSettings.h"
 #include "net/Mdns.h"
 
 #include "parsec-vdd.h" // VDD_MAX_DISPLAYS, to range-check --remove-display
@@ -123,7 +124,8 @@ int main(int argc, char** argv)
 
     std::string command = argc >= 2 ? argv[1] : "";
     bool oneOff = command == "--register-resolution" || command == "--cleanup-monitors" ||
-                  command == "--remove-display" || command == "--browse-mdns";
+                  command == "--remove-display" || command == "--browse-mdns" ||
+                  command == "--ensure-mtt-resolutions";
 
     // A one-off answers into the caller's terminal; a sender writes to the log,
     // and a headless one gets its own file so two of them don't truncate each
@@ -148,6 +150,24 @@ int main(int argc, char** argv)
         bool ok = w > 0 && h > 0 && od::VirtualDisplay::RegisterResolutions(w, h);
         printf("register %ux%u: %s\n", w, h, ok ? "ok" : "failed");
         rc = ok ? 0 : 1;
+    } else if (argc >= 4 && std::string(argv[1]) == "--ensure-mtt-resolutions") {
+        // Elevated one-off: merge hello + common 16-aligned iPad modes into the
+        // live MTT VDD settings XML and reload the MttVDD device so Display
+        // Settings picks up new modes. Invoked by SelfElevateEnsure.
+        auto w = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
+        auto h = static_cast<uint32_t>(strtoul(argv[3], nullptr, 10));
+        bool ok = false;
+        if (w > 0 && h > 0) {
+            const auto list = od::BuildIpadModeList(w, h);
+            od::MttEnsureResult r = od::EnsureResolutions(list);
+            ok = r.ok;
+            printf("ensure-mtt-resolutions %ux%u: %s (added %d, changed=%d) path=%ls detail=%s\n", w, h,
+                   ok ? "ok" : "failed", r.added, r.changed ? 1 : 0, r.path.c_str(), r.detail.c_str());
+        } else {
+            printf("ensure-mtt-resolutions: bad size\n");
+        }
+        rc = ok ? 0 : 1;
+
     } else if (argc >= 3 && std::string(argv[1]) == "--remove-display") {
         // Explicit one-off: unplug the virtual display at this index. Cleans up
         // after a sender that was killed rather than stopped — the driver keeps

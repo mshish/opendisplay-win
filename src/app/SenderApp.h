@@ -16,9 +16,9 @@ class Connection;
 // the headless CLI). The reconnect loop runs until stopped.
 class SenderApp {
 public:
-    // Blocked: an iPad with a different panel size is streaming. parsec-vdd
-    // puts one custom resolution on all of its virtual monitors, so this one
-    // would only get a letterboxed picture — it waits for the other to finish.
+    // Blocked: an iPad with a different panel size is streaming. We keep one
+    // panel size on the air (Parsec shares one custom mode; MTT serializes
+    // sizes) so this one waits rather than letterbox until the other finishes.
     enum class State { Idle, Connecting, Streaming, Blocked };
 
     SenderApp() = default;
