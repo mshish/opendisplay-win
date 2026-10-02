@@ -21,6 +21,22 @@ struct ExistingMonitor {
 // if none is currently attached to the desktop.
 bool FindMttVirtualMonitor(ExistingMonitor& out);
 
+// Same lookup; when requireAttached is false also returns a detached MTT head
+// (present in EnumDisplayDevices but not on the desktop) so we can re-attach.
+bool FindMttVirtualMonitorDevice(ExistingMonitor& out, bool requireAttached);
+
+// Attach a (possibly detached) GDI device with width x height @ hz.
+// When hasPosition is true, place at (posX, posY); otherwise use a first-time
+// default to the right of the current virtual desktop (not a hardcoded "below
+// primary"). Prefer RestoreMttDisplayTopology after attach when a saved
+// arrangement exists.
+bool AttachMonitorToDesktop(const std::wstring& deviceName, uint32_t width, uint32_t height,
+                            uint32_t hz, bool hasPosition = false, int posX = 0, int posY = 0);
+
+// Move an attached monitor without changing its mode. Absolute virtual-desktop
+// coordinates (same space as DEVMODE.dmPosition / MONITORINFO.rcMonitor).
+bool SetMonitorDesktopPosition(const std::wstring& deviceName, int posX, int posY);
+
 // Refresh rect for a known GDI device name.
 bool GetMonitorRectByDeviceName(const std::wstring& deviceName, RECT& out);
 
@@ -28,8 +44,15 @@ bool GetMonitorRectByDeviceName(const std::wstring& deviceName, RECT& out);
 bool EnsureMonitorRefresh(const std::wstring& deviceName, uint32_t fps);
 
 // Best-effort: set resolution + DMDO_DEFAULT (landscape) so DXGI capture
-// matches hello WxH. Used when Windows is on the swapped (portrait) mode.
+// matches hello WxH. Used on first hello / portrait-swap recovery only.
 bool EnsureMonitorMode(const std::wstring& deviceName, uint32_t width, uint32_t height,
                        uint32_t fps);
+
+// Leave resolution alone; only set DMDO_DEFAULT if orientation is wrong.
+bool EnsureMonitorLandscapeOrientation(const std::wstring& deviceName);
+
+// Best-effort: unplug a GDI device from the desktop (zeroed mode + apply).
+// Used when MTT settings count=0 still leaves a head attached after reload.
+bool DetachMonitorFromDesktop(const std::wstring& deviceName);
 
 } // namespace od

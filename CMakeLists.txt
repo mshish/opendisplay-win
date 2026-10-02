@@ -23,7 +23,6 @@ add_executable(opendisplay-win
   src/net/Mdns.cpp
   src/encode/AnnexB.cpp
   src/encode/H264Encoder.cpp
-  src/display/VirtualDisplay.cpp
   src/display/DesktopDuplication.cpp
   src/display/ExistingMonitor.cpp
   src/display/MttVddSettings.cpp
@@ -37,7 +36,6 @@ add_executable(opendisplay-win
 
 target_include_directories(opendisplay-win PRIVATE
   src
-  third_party/parsec-vdd
 )
 
 target_link_libraries(opendisplay-win PRIVATE
@@ -53,6 +51,7 @@ target_link_libraries(opendisplay-win PRIVATE
   setupapi
   cfgmgr32
   shell32
+  comctl32
   gdi32
   windowscodecs
   ole32
@@ -101,3 +100,14 @@ target_link_libraries(mft_encoder_probe PRIVATE
 )
 # Console subsystem so printf is visible when run from a terminal.
 set_target_properties(mft_encoder_probe PROPERTIES WIN32_EXECUTABLE FALSE)
+
+# Ship MTT CustomEdid binary next to the exe (EnsureCustomEdid looks here first).
+add_custom_command(TARGET opendisplay-win POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:opendisplay-win>/assets/mtt"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/assets/mtt/user_edid.bin"
+          "$<TARGET_FILE_DIR:opendisplay-win>/assets/mtt/user_edid.bin"
+  COMMENT "Copy MTT user_edid.bin next to opendisplay-win"
+)
+
+

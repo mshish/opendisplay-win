@@ -49,14 +49,15 @@ bool GetMonitorRectByDeviceName(const std::wstring& deviceName, RECT& out)
     return true;
 }
 
-bool FindMttVirtualMonitor(ExistingMonitor& out)
+bool FindMttVirtualMonitorDevice(ExistingMonitor& out, bool requireAttached)
 {
     for (DWORD i = 0;; ++i) {
         DISPLAY_DEVICEW adapter{};
         adapter.cb = sizeof(adapter);
         if (!EnumDisplayDevicesW(nullptr, i, &adapter, 0))
             break;
-        if ((adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0)
+        const bool adapterAttached = (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+        if (requireAttached && !adapterAttached)
             continue;
 
         for (DWORD m = 0;; ++m) {
@@ -64,7 +65,8 @@ bool FindMttVirtualMonitor(ExistingMonitor& out)
             mon.cb = sizeof(mon);
             if (!EnumDisplayDevicesW(adapter.DeviceName, m, &mon, 0))
                 break;
-            if ((mon.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0)
+            const bool monAttached = (mon.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+            if (requireAttached && !monAttached)
                 continue;
             if (!DeviceLooksLikeMtt(mon) && !DeviceLooksLikeMtt(adapter))
                 continue;
@@ -75,13 +77,84 @@ bool FindMttVirtualMonitor(ExistingMonitor& out)
             found.deviceName = adapter.DeviceName;
             found.deviceString = mon.DeviceString[0] ? mon.DeviceString : adapter.DeviceString;
             found.deviceId = mon.DeviceID[0] ? mon.DeviceID : adapter.DeviceID;
-            if (!GetMonitorRectByDeviceName(found.deviceName, found.rect))
-                continue;
+            if (monAttached)
+                (void)GetMonitorRectByDeviceName(found.deviceName, found.rect);
             out = std::move(found);
             return true;
         }
     }
     return false;
+}
+
+bool FindMttVirtualMonitor(ExistingMonitor& out)
+{
+    return FindMttVirtualMonitorDevice(out, /*requireAttached=*/true);
+}
+
+bool AttachMonitorToDesktop(const std::wstring& deviceName, uint32_t width, uint32_t height, uint32_t hz,
+                            bool hasPosition, int posX, int posY)
+{
+    if (deviceName.empty() || width == 0 || height == 0)
+        return false;
+
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    // Prefer current/registry mode as a template (works for detached heads).
+    if (!EnumDisplaySettingsExW(deviceName.c_str(), ENUM_REGISTRY_SETTINGS, &dm, 0) &&
+        !EnumDisplaySettingsW(deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm)) {
+        dm = {};
+        dm.dmSize = sizeof(dm);
+        dm.dmBitsPerPel = 32;
+    }
+
+    // First-time default: to the right of the virtual desktop so it does not
+    // cover existing displays. Callers with a saved arrangement pass hasPosition.
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    dm.dmPelsWidth = width;
+    dm.dmPelsHeight = height;
+    dm.dmDisplayOrientation = DMDO_DEFAULT;
+    dm.dmPosition.x = hasPosition ? posX : (vx + vw);
+    dm.dmPosition.y = hasPosition ? posY : 0;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_POSITION | DM_DISPLAYORIENTATION;
+    if (hz != 0) {
+        dm.dmDisplayFrequency = static_cast<DWORD>(hz);
+        dm.dmFields |= DM_DISPLAYFREQUENCY;
+    }
+    if (dm.dmBitsPerPel == 0) {
+        dm.dmBitsPerPel = 32;
+        dm.dmFields |= DM_BITSPERPEL;
+    }
+
+    const LONG staged =
+        ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr,
+                                 CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    if (staged != DISP_CHANGE_SUCCESSFUL && staged != DISP_CHANGE_RESTART)
+        return false;
+    const LONG applied = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    return applied == DISP_CHANGE_SUCCESSFUL || applied == DISP_CHANGE_RESTART;
+}
+
+bool SetMonitorDesktopPosition(const std::wstring& deviceName, int posX, int posY)
+{
+    if (deviceName.empty())
+        return false;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm))
+        return false;
+    if (dm.dmPosition.x == posX && dm.dmPosition.y == posY)
+        return true;
+    dm.dmPosition.x = posX;
+    dm.dmPosition.y = posY;
+    dm.dmFields = DM_POSITION;
+    const LONG staged =
+        ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr,
+                                 CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    if (staged != DISP_CHANGE_SUCCESSFUL && staged != DISP_CHANGE_RESTART)
+        return false;
+    const LONG applied = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    return applied == DISP_CHANGE_SUCCESSFUL || applied == DISP_CHANGE_RESTART;
 }
 
 
@@ -128,4 +201,40 @@ bool EnsureMonitorMode(const std::wstring& deviceName, uint32_t width, uint32_t 
     return r == DISP_CHANGE_SUCCESSFUL;
 }
 
+bool EnsureMonitorLandscapeOrientation(const std::wstring& deviceName)
+{
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm))
+        return false;
+    if (dm.dmDisplayOrientation == DMDO_DEFAULT)
+        return true;
+    dm.dmDisplayOrientation = DMDO_DEFAULT;
+    dm.dmFields = DM_DISPLAYORIENTATION;
+    const LONG r = ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+    return r == DISP_CHANGE_SUCCESSFUL;
+}
+
+
+bool DetachMonitorFromDesktop(const std::wstring& deviceName)
+{
+    if (deviceName.empty())
+        return false;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    // Zeroed geometry + CDS_UPDATEREGISTRY|CDS_NORESET, then a global apply,
+    // is the documented way to detach a display from the desktop.
+    dm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+    dm.dmPelsWidth = 0;
+    dm.dmPelsHeight = 0;
+    dm.dmPosition.x = 0;
+    dm.dmPosition.y = 0;
+    const LONG staged =
+        ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr,
+                                 CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    if (staged != DISP_CHANGE_SUCCESSFUL && staged != DISP_CHANGE_RESTART)
+        return false;
+    const LONG applied = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    return applied == DISP_CHANGE_SUCCESSFUL || applied == DISP_CHANGE_RESTART;
+}
 } // namespace od

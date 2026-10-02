@@ -1,16 +1,20 @@
 #pragma once
 
+#include <windows.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace od {
 
-// Merge iPad panel modes into the live MTT Virtual Display Driver settings XML
-// (C:\VirtualDisplayDriver\vdd_settings.xml) so Windows Display Settings lists
-// them on the MTT monitor. Does NOT ChangeDisplaySettings to force a mode -
-// the user picks in Display Settings. Writing the live path + restarting the
-// MttVDD device needs admin; the self-elevate one-shot covers that.
+// MTT Virtual Display Driver live config lives at
+// C:\VirtualDisplayDriver\{vdd_settings.xml,user_edid.bin}.
+// Mode list + stable monitor identity come from a shipped user_edid.bin
+// (CustomEdid=true). XML <resolutions> is kept mirrored to the same baked
+// landscape set because stock MTT still feeds IddCx QueryTargetModes from XML
+// (CustomEdid alone does not emulate resolutions). Writing the live path +
+// reloading MttVDD needs admin; the self-elevate one-shot covers that.
 
 struct MttMode {
     uint32_t width = 0;
@@ -20,7 +24,7 @@ struct MttMode {
 
 struct MttEnsureResult {
     bool ok = false;       // settings readable / modes present (or write+reload succeeded)
-    bool changed = false;  // XML was rewritten (reload ran)
+    bool changed = false;  // XML and/or EDID was rewritten (reload ran)
     int added = 0;         // number of <resolution> entries in the rewritten set
     std::wstring path;     // live settings path used
     std::string detail;    // short status for logging
@@ -29,20 +33,86 @@ struct MttEnsureResult {
 // Prefer C:\VirtualDisplayDriver\vdd_settings.xml when present.
 std::wstring FindLiveSettingsPath();
 
+// Fixed landscape modes baked into assets/mtt/user_edid.bin (and mirrored in XML).
+// Preferred / native first. Regenerated via tools/gen_user_edid.py.
+std::vector<MttMode> BakedMttModes();
+
 // Hello native size + same-aspect scales (1/2, 3/4) and matching iPad-class
-// sizes (~1% aspect). Ensure expands each with rotation @ 60 Hz.
+// sizes (~1% aspect). Kept for diagnostics; ensure path no longer rewrites XML
+// from hello (uses BakedMttModes + CustomEdid instead).
 std::vector<MttMode> BuildIpadModeList(uint32_t helloW, uint32_t helloH);
 
+// Install/refresh C:\VirtualDisplayDriver\user_edid.bin from the shipped asset,
+// set CustomEdid=true + PreventSpoof=true, mirror BakedMttModes into XML
+// <resolutions>, reload MttVDD. Idempotent when already current.
+MttEnsureResult EnsureCustomEdid();
+
 // Rewrite <resolutions> to the wanted set only (prune other aspects) without
-// touching gpu/options/monitors. Idempotent when the set already matches.
+// touching gpu/options/monitors. Prefer EnsureCustomEdid for the sender path.
 // Needs admin to write the live path; returns ok=false with detail on denial.
 MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted);
 
-// Elevated one-shot used by --ensure-mtt-resolutions and SelfElevateEnsure.
+// Elevated one-shot used by --ensure-mtt-resolutions / --ensure-mtt-edid.
 bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH);
 
-// Sender entry: build common+hello list, Ensure; on Access Denied self-elevate.
-// Logs via Logf. UAC decline -> log and return false (caller continues).
+// Sender entry: EnsureCustomEdid (shipped bin + CustomEdid + baked XML modes).
+// helloW/H kept for log context only. UAC decline -> log and return false.
 bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag);
+
+// Read <monitors><count> from live settings. Returns -1 if missing/unreadable.
+int ReadMonitorCount();
+
+// Write <monitors><count>N</count> and reload MttVDD. Idempotent when already N.
+// Needs admin to write the live path.
+MttEnsureResult SetMonitorCount(uint32_t count);
+
+// Elevated one-shot used by --set-mtt-monitor-count.
+bool SelfElevateSetMonitorCount(uint32_t count);
+
+// Ensure at least one MTT head is attached (set count>=1 + reload if needed).
+// No-op when a MTT monitor is already on the desktop. Logs via Logf.
+// Cancels any pending link-loss grace teardown. After a fresh CDS attach,
+// reapplies the last saved CCD position (see SaveMttDisplayTopology).
+bool EnsureMttVddAttached(const std::string& logTag);
+
+// Drop MTT heads via CDS detach. Prefer RequestMttVddTeardown so link-loss
+// flaps keep the head sticky across USB<->Wi-Fi.
+bool TearDownMttVdd(const std::string& logTag);
+
+// How long after link loss (socket drop / transport flap) we keep the MTT head
+// attached waiting for a client hello. Cancelled by EnsureMttVddAttached.
+constexpr int kMttLinkLossGraceMs = 12000;
+
+enum class MttTeardownReason {
+    UserInitiated, // tray Disconnect / Exit / Stop / app quit
+    LinkLoss,      // socket drop, usbmux fail, transport switch, pipeline fail
+};
+
+// UserInitiated: cancel grace and TearDown now.
+// LinkLoss: start/restart the grace timer; TearDown only if it expires with
+// no intervening Ensure/Cancel (client did not return).
+void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason);
+
+// Cancel a pending link-loss grace teardown (client returned).
+void CancelPendingMttVddTeardown();
+
+// Persist the MTT head's current CCD position/mode under
+// %APPDATA%\opendisplay-win\mtt_display.json, keyed by MTT1337 identity (not
+// \\.\DISPLAYn). Logs "mtt: saved position (x,y) WxH@hz".
+bool SaveMttDisplayTopology(const std::string& logTag);
+
+// True when mtt_display.json has a usable width x height (hz optional; 0 -> caller
+// picks a default). Does not touch the desktop.
+bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz);
+
+// After CDS attach: find the MTT head by identity and reapply saved x,y and
+// mode (WxH@hz) when available. No-op when nothing saved yet. Logs
+// "mtt: restored position (x,y)" / "mtt: restoring saved mode WxH@hz".
+bool RestoreMttDisplayTopology(const std::string& logTag);
+
+// If the MTT head's desktop position or mode changed since lastObserved, save
+// and update lastObserved. Used while streaming so Mike's Display Settings
+// drags / resolution picks survive the next reconnect / app run.
+void PollMttDisplayTopology(const std::string& logTag, POINT& lastObserved);
 
 } // namespace od

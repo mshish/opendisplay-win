@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <climits>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -20,7 +21,6 @@
 #include "display/DesktopDuplication.h"
 
 #include <wrl/client.h>
-#include "display/VirtualDisplay.h"
 #include "display/ExistingMonitor.h"
 #include "display/MttVddSettings.h"
 #include "encode/H264Encoder.h"
@@ -48,11 +48,10 @@ constexpr int kCursorUdpAckMs = 5000;    // drop UDP and stay on TCP if no curso
 
 // Only one panel size may be on the air at a time.
 //
-// Parsec VDD: one custom resolution is shared across all its virtual monitors,
-// so a second iPad with a different panel would get a letterboxed picture.
 // MTT VDD: modes are independent per monitor (merged into vdd_settings.xml),
 // but we still serialize panel sizes so two senders never fight over rebuilds.
 // Same-size iPads share; a different size waits until the display is free.
+// (Parsec VDD path removed - this fork is MTT-only.)
 //
 // Process-wide, because the tray drives every sender. A headless CLI sender
 // started next to the tray is outside this and can still take the mode with
@@ -87,7 +86,8 @@ bool AcquirePanel(uint32_t w, uint32_t h, uint32_t& activeW, uint32_t& activeH)
     return true;
 }
 
-void ReleasePanel()
+// Returns true when this release dropped the holder count to zero (last client).
+bool ReleasePanel()
 {
     PanelState& panel = Panel();
     std::lock_guard<std::mutex> lock(panel.mutex);
@@ -95,7 +95,9 @@ void ReleasePanel()
         panel.holders = 0;
         panel.width = 0;
         panel.height = 0;
+        return true;
     }
+    return false;
 }
 
 // Rotation: the panel is the same device, just turned. Only the sole holder
@@ -238,6 +240,7 @@ void SenderApp::Stop()
     running_ = false;
     stopRequested_ = false;
     state_ = State::Idle;
+    transport_ = Transport::None;
 }
 
 void SenderApp::RunBlocking(std::string ip, uint16_t port)
@@ -278,21 +281,16 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     // (destroyed LAST) — otherwise DesktopDuplication's D3D11/DXGI COM objects
     // would be released after CoUninitialize(), an access violation on Stop().
     H264Encoder encoder;
-    VirtualDisplay vdisp;
     DesktopDuplication dup;
     InputInjector input;
     std::mutex pipelineMutex;
     bool gpuNv12Path = false; // VideoProcessor BGRA->NV12 + EncodeDxgiNv12
     bool haveGpuDesktopFrame = false; // true after first successful GPU present
 
-    // Keeps this sender's monitor position separate from the other iPads' —
-    // several senders share one HKCU key.
-    vdisp.SetIdentity(ip);
-
-    // Prefer Intel-pinned MTT Virtual Display Driver when present so capture
-    // and QSV share a GPU (no Parsec adapter bounce). Fall back to Parsec VDD.
+    // MTT-only: capture + QSV share the Intel VDD. No Parsec fallback.
     bool usingMttVdd = false;
     bool mttModesEnsured = false; // once per connection; Ensure is idempotent too
+    bool mttHelloModeForced = false; // force hello WxH once; later honor Keep
     ExistingMonitor mttMon{};
     // Updated once the dial settles (USB vs Wi-Fi); buildPipeline / reconfigure read these.
     EncodeKnobs sessionEncode;
@@ -303,52 +301,72 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // Caller holds pipelineMutex.
         dup.Close();
 
+        // Re-attach MTT head if a prior last-client teardown dropped it.
+        Logf(ip, "mtt: ensuring VDD for hello\n");
+        (void)EnsureMttVddAttached(ip);
         usingMttVdd = FindMttVirtualMonitor(mttMon);
         if (usingMttVdd) {
-            Logf(ip, "using MTT virtual monitor %ls (%ls) - Intel-side VDD, skipping Parsec\n",
+            Logf(ip, "using MTT virtual monitor %ls (%ls)\n",
                  mttMon.deviceName.c_str(), mttMon.deviceString.c_str());
-            // Merge hello + a few 16-aligned iPad modes into live MTT settings XML.
+            // Ensure CustomEdid + shipped user_edid.bin (baked landscape modes + stable serial).
             // Does not auto-switch the desktop mode - user picks in Display Settings.
             if (!mttModesEnsured) {
                 EnsureMttResolutionsForHello(width, height, ip);
                 mttModesEnsured = true; // even on UAC decline: one prompt per connection
             }
-            // Force hello WxH + landscape orientation so DXGI capture matches
-            // the iPad negotiation (portrait ModeDesc + landscape hello = sideways).
-            if (!EnsureMonitorMode(mttMon.deviceName, width, height, kFps)) {
-                Logf(ip, "MTT mode %ux%u@%u failed (keeping current)\n", width, height, kFps);
+            // First hello of a connection: restore saved topology mode when
+            // present (Mike's Display Settings pick). Only force hello-native
+            // on first-ever attach (no mtt_display.json mode yet). Later
+            // rebuilds honor Keep and only fix orientation / refresh.
+            if (!mttHelloModeForced) {
+                uint32_t savedW = 0, savedH = 0, savedHz = 0;
+                if (QueryMttSavedMode(savedW, savedH, savedHz)) {
+                    const uint32_t applyHz = savedHz ? savedHz : kFps;
+                    if (!EnsureMonitorMode(mttMon.deviceName, savedW, savedH, applyHz)) {
+                        Logf(ip, "mtt: restoring saved mode %ux%u@%u failed (keeping current)\n",
+                             savedW, savedH, applyHz);
+                        if (EnsureMonitorLandscapeOrientation(mttMon.deviceName))
+                            Logf(ip, "MTT orientation ensured landscape (resolution unchanged)\n");
+                        if (!EnsureMonitorRefresh(mttMon.deviceName, applyHz))
+                            Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", applyHz);
+                    } else {
+                        Logf(ip, "mtt: restoring saved mode %ux%u@%u\n", savedW, savedH, applyHz);
+                    }
+                } else {
+                    if (!EnsureMonitorMode(mttMon.deviceName, width, height, kFps)) {
+                        Logf(ip, "mtt: no saved mode - forcing hello native %ux%u failed "
+                                 "(keeping current)\n",
+                             width, height);
+                        if (!EnsureMonitorRefresh(mttMon.deviceName, kFps))
+                            Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", kFps);
+                        else
+                            Logf(ip, "MTT refresh set to %u Hz\n", kFps);
+                    } else {
+                        Logf(ip, "mtt: no saved mode - forcing hello native %ux%u\n", width, height);
+                    }
+                }
+                mttHelloModeForced = true;
+            } else {
+                if (EnsureMonitorLandscapeOrientation(mttMon.deviceName))
+                    Logf(ip, "MTT orientation ensured landscape (resolution unchanged)\n");
+                else
+                    Logf(ip, "MTT landscape orientation request failed (keeping current)\n");
                 if (!EnsureMonitorRefresh(mttMon.deviceName, kFps))
                     Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", kFps);
-                else
-                    Logf(ip, "MTT refresh set to %u Hz\n", kFps);
-            } else {
-                Logf(ip, "MTT mode set to %ux%u@%u (DMDO_DEFAULT)\n", width, height, kFps);
             }
             if (!dup.Open(mttMon.deviceName)) {
                 Logf(ip, "DesktopDuplication::Open failed on MTT device\n");
                 return false;
             }
-            if (GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect))
-                input.SetMonitorRect(mttMon.rect);
-            else
-                input.SetMonitorRect(mttMon.rect);
+            if (!GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect)) {
+                // keep prior mttMon.rect if Enum failed
+            }
+            input.SetMonitorRect(mttMon.rect);
+            Logf(ip, "mtt: input rect %ls L=%ld T=%ld R=%ld B=%ld\n", mttMon.deviceName.c_str(),
+                 mttMon.rect.left, mttMon.rect.top, mttMon.rect.right, mttMon.rect.bottom);
         } else {
-            if (!vdisp.IsOpen() && !vdisp.Open()) {
-                Logf(ip, "VirtualDisplay::Open failed (parsec-vdd driver missing/inaccessible?)\n");
-                return false;
-            }
-            // Release capture before EnsureResolution (Parsec path only): rotation
-            // rebuild tears down the virtual display under a live DXGI duplication
-            // and can crash DWM / Display Settings.
-            if (!vdisp.EnsureResolution(width, height, kFps)) {
-                Logf(ip, "VirtualDisplay::EnsureResolution failed (run as Administrator?)\n");
-                return false;
-            }
-            if (!dup.Open(vdisp.DeviceName())) {
-                Logf(ip, "DesktopDuplication::Open failed\n");
-                return false;
-            }
-            input.SetMonitorRect(vdisp.MonitorRect());
+            Logf(ip, "MTT virtual monitor not found (Intel VDD required; Parsec path removed)\n");
+            return false;
         }
         // Bind encoder here (not later on size-flip with HW disabled): QSV needs
         // an Intel D3D device + SET_D3D_MANAGER before the first Configure.
@@ -368,14 +386,16 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                  dup.Width(), dup.Height(), encW, encH);
         }
         gpuNv12Path = false;
-        bool haveIntelD3d = false;
-        if (dup.Device() && dup.Context() && encoder.AdoptD3DDevice(dup.Device(), dup.Context()))
-            haveIntelD3d = true;
-        else if (encoder.EnsureIntelEncoderDevice())
-            haveIntelD3d = true;
-        if (!haveIntelD3d)
-            Logf(ip, "Intel encoder D3D device unavailable - HW encode may fall back\n");
         encoder.SetAllowHardware(true);
+        {
+            bool haveIntelD3d = false;
+            if (dup.Device() && dup.Context() && encoder.AdoptD3DDevice(dup.Device(), dup.Context()))
+                haveIntelD3d = true;
+            else if (encoder.EnsureIntelEncoderDevice())
+                haveIntelD3d = true;
+            if (!haveIntelD3d)
+                Logf(ip, "Intel encoder D3D device unavailable - HW encode may fall back\n");
+        }
         if (!encoder.Configure(encW, encH, kFps, sessionEncode.peakBitrateBps,
                                sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds,
                                sessionEncode.useQualityRc, sessionEncode.rcQuality)) {
@@ -435,7 +455,9 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
     bool blockedLogged = false; // the wait message belongs in the log once, not every retry
 
-    while (!stopRequested_) {
+        bool stickToUsbAfterSession = false;
+
+while (!stopRequested_) {
         // A blocked sender keeps checking back every few seconds; flipping it to
         // Connecting for each of those attempts would make the tray entry
         // alternate between "waiting for 2732x2048" and "connecting..." while
@@ -443,13 +465,20 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         if (state_ != State::Blocked)
             state_ = State::Connecting;
 
-        // USB preferred only while usbmux + a USB device are available.
-        // Configured Wi-Fi IP stays the fallback target (never removed).
+        // USB preferred while usbmux + a USB device are available.
+        // usbWifiFailover (default ON) keeps today's behavior: if USB dial
+        // fails or the cable drops after a USB session, fall back to Wi-Fi.
+        // When OFF, after a USB session we wait for USB again instead of
+        // staying on Wi-Fi; Wi-Fi-only iPads (never USB this run) still work.
+        const Config connectCfg = Config::Load();
+        const bool allowWifiFailover = connectCfg.usbWifiFailover;
+
         bool usbSession = false;
         std::optional<Connection> conn;
         UsbMuxDevice usbDev{};
         const bool configuredLoopback = IsUsbLikeHost(ip);
-        if (!configuredLoopback && ProbeUsbMux(usbDev) && usbDev.present) {
+        const bool usbAvailable = !configuredLoopback && ProbeUsbMux(usbDev) && usbDev.present;
+        if (usbAvailable) {
             Logf(ip, "USB usbmux device %s, preferring 127.0.0.1:%u over Wi-Fi %s:%u\n",
                  usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), kUsbMuxLocalPort,
                  ip.c_str(), port);
@@ -464,12 +493,21 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 usbSession = true;
                 Logf(ip, "connected via USB (usbmux localhost:%u -> iPad:%u)\n",
                      kUsbMuxLocalPort, port);
+            } else if (!allowWifiFailover) {
+                Logf(ip, "USB usbmux dial failed, Wi-Fi failover off, retrying USB\n");
+                InterruptibleSleep(kReconnectDelayMs);
+                continue;
             } else {
                 Logf(ip, "USB usbmux dial failed, falling back to Wi-Fi %s:%u\n",
                      ip.c_str(), port);
             }
         }
         if (!conn) {
+            if (!allowWifiFailover && stickToUsbAfterSession) {
+                Logf(ip, "USB cable dropped, Wi-Fi failover off, waiting for USB\n");
+                InterruptibleSleep(kReconnectDelayMs);
+                continue;
+            }
             Logf(ip, "connecting to %s:%u ...\n", ip.c_str(), port);
             conn = Connection::Connect(ip, port);
         }
@@ -479,10 +517,15 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             continue;
         }
         ActiveConn activeConn(this, &*conn);
-        if (!usbSession)
-            Logf(ip, "connected via Wi-Fi, waiting for hello...\n");
-        else
+        transport_ = usbSession ? Transport::Usb : Transport::Wifi;
+        if (usbSession) {
+            // Remember a successful USB session so a later cable-drop does not
+            // silently move to Wi-Fi when the user turned failover off.
+            stickToUsbAfterSession = !allowWifiFailover;
             Logf(ip, "USB path waiting for hello...\n");
+        } else {
+            Logf(ip, "connected via Wi-Fi, waiting for hello...\n");
+        }
 
         HelloMsg hello;
         bool gotHello = false;
@@ -500,6 +543,14 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         }
         if (!gotHello)
             continue;
+
+        // Learn USB serial <-> hello.id so Settings can merge Nearby without guessing.
+        if (usbSession && !usbDev.serial.empty() && !hello.id.empty()) {
+            Config learned = Config::Load();
+            learned.RememberUsbSerialId(usbDev.serial, hello.id);
+            learned.Save();
+            Logf(ip, "USB serial %s bound to id %s\n", usbDev.serial.c_str(), hello.id.c_str());
+        }
 
         // Version handshake (receiver protocol 3+): the iPad only sends
         // `pencil`/`proximity` to a peer that announced protocol >= 3 —
@@ -530,7 +581,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             if (!blockedLogged) {
                 blockedLogged = true;
                 Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u - only one "
-                         "panel size at a time (Parsec shares one custom mode; MTT keeps sizes serialized)\n",
+                         "panel size at a time (MTT keeps sizes serialized)\n",
                      activeWidth, activeHeight, width, height);
             }
             conn->Close();
@@ -567,7 +618,17 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             pipelineOk = buildPipeline(width, height);
         }
         if (!pipelineOk) {
+            dup.Close();
             conn->Close();
+            if (panel.held) {
+                panel.held = false;
+                if (ReleasePanel() && usingMttVdd) {
+                    // Pipeline failed but session may reconnect - keep VDD sticky.
+                    RequestMttVddTeardown(ip, MttTeardownReason::LinkLoss);
+                    mttModesEnsured = false;
+                    mttHelloModeForced = false;
+                }
+            }
             InterruptibleSleep(kReconnectDelayMs);
             continue;
         }
@@ -575,6 +636,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         width_ = width;
         height_ = height;
         state_ = State::Streaming;
+        if (usingMttVdd)
+            (void)SaveMttDisplayTopology(ip);
 
         std::atomic<bool> running{true};
         bool loggedPencil = false; // reader-thread only; one line per connection
@@ -595,6 +658,26 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         std::vector<double> pendingPongTs;
         auto lastSenderPing = std::chrono::steady_clock::now();
         constexpr int kSenderPingMs = 2000;
+
+        // Touch/pen/scroll must target the MTT capture head (mttMon).
+        RECT lastLoggedMttInputRect{};
+        bool loggedMttInputRect = false;
+        auto refreshInputRect = [&]() {
+            RECT r = mttMon.rect;
+            if (GetMonitorRectByDeviceName(mttMon.deviceName, r))
+                mttMon.rect = r;
+            else
+                r = mttMon.rect;
+            input.SetMonitorRect(r);
+            if (!loggedMttInputRect || r.left != lastLoggedMttInputRect.left ||
+                r.top != lastLoggedMttInputRect.top || r.right != lastLoggedMttInputRect.right ||
+                r.bottom != lastLoggedMttInputRect.bottom) {
+                Logf(ip, "mtt: input rect %ls L=%ld T=%ld R=%ld B=%ld\n", mttMon.deviceName.c_str(),
+                     r.left, r.top, r.right, r.bottom);
+                lastLoggedMttInputRect = r;
+                loggedMttInputRect = true;
+            }
+        };
 
 std::thread reader([&] {
             while (running && !stopRequested_) {
@@ -685,11 +768,11 @@ std::thread reader([&] {
                         // lock is needed. Refresh the mapping rect first
                         // (thread-safe read) so a live monitor drag is followed
                         // immediately instead of only after the next reconnect.
-                        input.SetMonitorRect(vdisp.MonitorRect());
+                        refreshInputRect();
                         input.HandleTouch(msg->touch);
                         break;
                     case ControlType::Scroll:
-                        input.SetMonitorRect(vdisp.MonitorRect());
+                        refreshInputRect();
                         input.HandleScroll(msg->scroll);
                         break;
                     case ControlType::Pencil:
@@ -699,11 +782,11 @@ std::thread reader([&] {
                             loggedPencil = true;
                             Logf(ip, "pencil input active (receiver honoured welcome pv=3)\n");
                         }
-                        input.SetMonitorRect(vdisp.MonitorRect());
+                        refreshInputRect();
                         input.HandlePencil(msg->pencil);
                         break;
                     case ControlType::Proximity:
-                        input.SetMonitorRect(vdisp.MonitorRect());
+                        refreshInputRect();
                         input.HandleProximity(msg->proximity);
                         break;
                     case ControlType::CursorAck: {
@@ -739,7 +822,6 @@ std::thread reader([&] {
         // Set when the monitor rect couldn't be read right after a geometry
         // change (the desktop can still be mid-reconfigure); retried below
         // until it succeeds, because nothing else refreshes it in place.
-        bool rectStale = false;
 
         // Watchdog for the panel size (see the check further down): when the
         // monitor is left on a size that isn't this iPad's, this is when it
@@ -776,6 +858,8 @@ std::thread reader([&] {
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
         bool sizeGiveUpLogged = false;
+        POINT mttLastPos{INT_MIN, INT_MIN};
+        std::chrono::steady_clock::time_point lastMttPosPoll{};
         std::chrono::steady_clock::time_point waitFirstFrameSince{};
         bool firstFrameNudged = false;
         bool firstFrameWaitLogged = false;
@@ -851,16 +935,16 @@ std::thread reader([&] {
                     }
                 }
 
-                // Mode change / ACCESS_LOST: Reopen() made a fresh D3D device.
-                // The HW MFT is still bound to the old one - keep feeding it and
-                // ProcessInput E_FAIL freezes the iPad. Rebuild capture+encoder.
+                // Mode change / ACCESS_LOST: CaptureFrame already Reopen()'d.
+                // QSV DXGI path shares the capture D3D device with the MFT, so a
+                // new capture device requires a full encoder rebuild.
                 if (cap.accessLost) {
-                    Logf(ip, "capture ACCESS_LOST - rebuilding pipeline (new D3D device)\n");
                     haveGpuDesktopFrame = false;
-                    gpuNv12Path = false;
                     waitFirstFrameSince = {};
                     firstFrameNudged = false;
                     firstFrameWaitLogged = false;
+                    Logf(ip, "capture ACCESS_LOST - rebuilding pipeline (new D3D device)\n");
+                    gpuNv12Path = false;
                     if (!buildPipeline(width, height)) {
                         Logf(ip, "pipeline rebuild after ACCESS_LOST failed, dropping the connection\n");
                         running = false;
@@ -968,51 +1052,31 @@ std::thread reader([&] {
                     } else {
                         width_ = dup.Width();
                         height_ = dup.Height();
-                        if (usingMttVdd) {
-                            if (GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect))
-                                input.SetMonitorRect(mttMon.rect);
-                            rectStale = false;
-                        } else {
-                            rectStale = !vdisp.QueryMonitorRect();
-                            input.SetMonitorRect(vdisp.MonitorRect());
-                        }
+                        if (GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect))
+                            input.SetMonitorRect(mttMon.rect);
                         continue; // capture a fresh frame on the new pipeline
                     }
-                } else if (rectStale && vdisp.QueryMonitorRect()) {
-                    // The desktop was still mid-reconfigure above. Without this
-                    // retry the touch mapping would stay on the old geometry
-                    // until the monitor is moved or the pipeline rebuilt.
-                    input.SetMonitorRect(vdisp.MonitorRect());
-                    rectStale = false;
                 }
 
                 auto now = std::chrono::steady_clock::now();
 
-                // Adding or removing *any* parsec virtual display resets the
-                // mode of *every* parsec monitor; Windows then restores each
-                // one from what it last persisted for that display path. With
-                // two iPads the paths get swapped around, so a neighbour
-                // connecting can leave this monitor on the other iPad's size —
-                // the picture then arrives letterboxed on this panel. The
-                // reconfigure above keeps it correct but wrong-shaped, so once
-                // the churn has settled, put our own size back.
-                //
-                // Only when the size is neither the panel's nor the panel
-                // rotated: a rotation made in Windows is the user's decision
-                // and is adopted, not undone.
+                // Persist Mike's MTT arrangement while streaming (DISPLAY index may change later).
+                if (usingMttVdd &&
+                    (lastMttPosPoll == std::chrono::steady_clock::time_point{} ||
+                     now - lastMttPosPoll > std::chrono::seconds(2))) {
+                    lastMttPosPoll = now;
+                    PollMttDisplayTopology(ip, mttLastPos);
+                }
+
                 // Only adopt rotation into session size from a real frame - not
                 // Open() ModeDesc, which can disagree with DXGI buffer orientation.
+                // Foreign size after churn: log once (MTT does not ModeDesc-rebuild).
                 if (changed && dup.HaveDesktopFrame() &&
                     dup.Width() == height && dup.Height() == width) {
                     std::swap(width, height); // rotated in Windows: that is the panel size now
                 }
-                // Exactly one attempt, and only after the churn has settled. A
-                // rebuild resets every parsec monitor in turn, so retrying is
-                // how two senders end up trading rebuilds forever — and a
-                // second attempt can't help anyway: either Windows had merely
-                // restored a stale mode for this display path (the rebuild
-                // fixes that), or another sender's panel size is in force, and
-                // then no amount of rebuilding wins (see the note below).
+                // Exactly one log attempt after churn settles. MTT does not
+                // ModeDesc-rebuild (fights capture-driven encode WxH).
                 if (dup.Width() == width && dup.Height() == height) {
                     wrongSizeSince = {};
                     sizeRebuildDone = false;
@@ -1024,40 +1088,16 @@ std::thread reader([&] {
                     // re-applying the mode on the live monitor is refused
                     // (DISP_CHANGE_BADMODE) while the capture runs.
                     sizeRebuildDone = true;
-                    if (usingMttVdd) {
-                        // MTT: do not rebuild to ModeDesc - fights capture-driven encode WxH.
-                        Logf(ip, "monitor sits at %ux%u (session %ux%u) - MTT: not forcing ModeDesc rebuild\n",
-                             dup.Width(), dup.Height(), width, height);
-                    } else {
-                        Logf(ip, "monitor sits at %ux%u instead of %ux%u, rebuilding once to capture size\n",
-                             dup.Width(), dup.Height(), width, height);
-                        const uint32_t capW = Align16Ceil(dup.Width());
-                        const uint32_t capH = Align16Ceil(dup.Height());
-                        if (capW && capH) {
-                            width = capW;
-                            height = capH;
-                        }
-                        if (!buildPipeline(width, height))
-                            Logf(ip, "rebuild for the panel size failed, keeping what we have\n");
-                        else
-                            continue; // nv12 still holds the pre-rebuild frame
-                    }
+                    // MTT: do not rebuild to ModeDesc - fights capture-driven encode WxH.
+                    Logf(ip, "monitor sits at %ux%u (session %ux%u) - MTT: not forcing ModeDesc rebuild\n",
+                         dup.Width(), dup.Height(), width, height);
                 } else if (sizeRebuildDone && !sizeGiveUpLogged) {
-                    // Parsec: one custom mode on every virtual monitor - another
-                    // sender's size wins and this panel letterboxes. MTT: modes
-                    // are independent; a mismatch usually means Display Settings
-                    // is on a non-native size (e.g. 16:9 on a 3:2 iPad) - pick
-                    // the hello size on the MTT monitor. Said once per connection.
+                    // MTT modes are independent; mismatch usually means Display Settings
+                    // is on a non-native size. Said once per connection.
                     sizeGiveUpLogged = true;
-                    if (usingMttVdd) {
-                        Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): pick %ux%u on the MTT monitor in "
-                                 "Display Settings - letterboxing means the desktop aspect doesn't match the panel\n",
-                             dup.Width(), dup.Height(), width, height, width, height);
-                    } else {
-                        Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): parsec-vdd shares one custom resolution "
-                                 "across all its monitors, so the picture stays letterboxed here\n",
-                             dup.Width(), dup.Height(), width, height);
-                    }
+                    Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): pick %ux%u on the MTT monitor in "
+                             "Display Settings - letterboxing means the desktop aspect doesn't match the panel\n",
+                         dup.Width(), dup.Height(), width, height, width, height);
                 }
 
                 if (changed)
@@ -1289,8 +1329,27 @@ std::thread reader([&] {
         reader.join();
         // After the reader is gone, so nothing else touches the injector.
         input.EndSession();
+        // Drop DXGI hold on the virtual head before MTT detach (reload).
+        dup.Close();
+        bool lastClient = false;
+        if (panel.held) {
+            panel.held = false;
+            lastClient = ReleasePanel();
+        }
+        if (lastClient && usingMttVdd) {
+            // stopRequested_ => tray Disconnect / Exit / Stop (user-initiated).
+            // Otherwise socket drop / transport flap: grace window, sticky VDD.
+            const MttTeardownReason reason =
+                stopRequested_ ? MttTeardownReason::UserInitiated : MttTeardownReason::LinkLoss;
+            RequestMttVddTeardown(ip, reason);
+            if (reason == MttTeardownReason::UserInitiated)
+                usingMttVdd = false;
+            mttModesEnsured = false;
+            mttHelloModeForced = false;
+        }
         width_ = 0;
         height_ = 0;
+        transport_ = Transport::None;
         Logf(ip, "disconnected%s\n", stopRequested_ ? "" : ", reconnecting");
     }
 

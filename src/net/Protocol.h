@@ -31,6 +31,9 @@ struct TouchMsg {
     TouchPhase phase = TouchPhase::Unknown;
     double x = 0.0; // normalized [0,1], origin top-left
     double y = 0.0;
+    // Wire contact id when present; absent => 0. Single-finger today; multi
+    // fingers reuse the same frame shape with distinct ids.
+    uint32_t id = 0;
 };
 
 struct ScrollMsg {
@@ -87,3 +90,4 @@ bool IsControlPayload(const uint8_t* data, size_t size);
 std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t size);
 
 } // namespace od
+

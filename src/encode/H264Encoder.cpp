@@ -117,19 +117,17 @@ struct H264Encoder::Impl {
         return L"(unnamed)";
     }
 
-    // Lower preference number = try first. Prefer discrete GPU encoders so we
-    // can use NVENC while DXGI capture stays on the iGPU that owns Parsec's VDD.
+    // Lower preference number = try first. Prefer Intel QSV on the DXGI capture
+    // device (MTT / Optimus), then other hardware MFTs, then software.
     static int HwPreference(const std::wstring& name)
     {
         std::wstring lower = name;
         for (auto& c : lower)
             c = static_cast<wchar_t>(towlower(c));
         auto has = [&](const wchar_t* sub) { return lower.find(sub) != std::wstring::npos; };
-        if (has(L"nvidia") || has(L"nvenc"))
-            return 0;
-        // Prefer Intel QSV after NVIDIA: same-side as typical Parsec/iGPU
-        // capture on Optimus, unlike NVENC which often ActivateObject-fails.
         if (has(L"intel") || has(L"quick sync") || has(L"qsv"))
+            return 0;
+        if (has(L"nvidia") || has(L"nvenc"))
             return 1;
         if (has(L"amd") || has(L"vce") || has(L"amf") || has(L"radeon"))
             return 2;
@@ -260,7 +258,7 @@ struct H264Encoder::Impl {
 
     bool EnsureIntelEncoderDevice()
     {
-        if (d3dDevice && dxgiManager && d3dContext)
+        if (d3dDevice && dxgiManager && d3dContext && IsIntelDevice(d3dDevice.Get()))
             return true;
 
         d3dDevice.Reset();
@@ -350,9 +348,10 @@ struct H264Encoder::Impl {
         HRESULT hr = mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                                          reinterpret_cast<ULONG_PTR>(dxgiManager.Get()));
         if (FAILED(hr)) {
-            Logf("encoder", "MFT_MESSAGE_SET_D3D_MANAGER failed: %s hr=0x%08lX\n",
+            Logf("encoder", "MFT_MESSAGE_SET_D3D_MANAGER failed: %s hr=0x%08lX - using sysmem input\n",
                  NarrowAscii(mftName).c_str(), static_cast<unsigned long>(hr));
-            return false;
+            useDxgiInput = false;
+            return true;
         }
         useDxgiInput = true;
         Logf("encoder", "MFT D3D manager set (DXGI NV12 input): %s\n", NarrowAscii(mftName).c_str());
@@ -719,7 +718,8 @@ struct H264Encoder::Impl {
             });
         }
 
-        Logf("encoder", "MFTEnumEx(%s): %u candidate(s)\n", hardware ? "hardware" : "software", count);
+        Logf("encoder", "MFTEnumEx(%s): %u candidate(s)\n", hardware ? "hardware" : "software",
+             static_cast<unsigned>(candidates.size()));
         for (const auto& c : candidates)
             Logf("encoder", "  [%u] pref=%d %s\n", c.index, c.preference, NarrowAscii(c.name).c_str());
 
@@ -968,11 +968,16 @@ bool H264Encoder::Configure(uint32_t width, uint32_t height, uint32_t fps, uint3
     impl_->nv12Staging.Reset();
     impl_->ResetMft();
 
-    // Walk every hardware activate (NVIDIA first), then software. Previously we
-    // only ActivateObject'd activates[0]; one bad first entry dropped us on the
-    // Microsoft software MFT with no HRESULT in the log.
+    // Walk every hardware activate (Intel QSV preferred), then software.
+    // Previously we only ActivateObject'd activates[0]; one bad first entry
+    // dropped us on the Microsoft software MFT with no HRESULT in the log.
     impl_->consecutiveAsyncTimeouts = 0;
     impl_->lastAsyncTimedOut = false;
+
+    if (!impl_->d3dDevice) {
+        if (!impl_->EnsureIntelEncoderDevice())
+            Logf("encoder", "Configure: Intel D3D device unavailable - HW may fall back\n");
+    }
 
     bool hwOk = false;
     if (impl_->allowHardware)

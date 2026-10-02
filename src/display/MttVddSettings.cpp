@@ -1,5 +1,7 @@
 #include "display/MttVddSettings.h"
 
+#include "display/ExistingMonitor.h"
+
 #include "app/Log.h"
 
 #include <windows.h>
@@ -9,12 +11,19 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <cstdint>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace od {
@@ -22,7 +31,11 @@ namespace od {
 namespace {
 
 constexpr wchar_t kLiveSettingsPath[] = L"C:\\VirtualDisplayDriver\\vdd_settings.xml";
+constexpr wchar_t kLiveEdidPath[] = L"C:\\VirtualDisplayDriver\\user_edid.bin";
 constexpr wchar_t kAppsSettingsPath[] = L"D:\\apps\\VirtualDisplayDriver\\vdd_settings.intel.xml";
+constexpr wchar_t kAppsEdidPath[] = L"D:\\apps\\VirtualDisplayDriver\\user_edid.bin";
+// Dev-tree fallback when running an unpackaged build from the repo.
+constexpr wchar_t kDevEdidPath[] = L"D:\\projects\\opendisplay-win\\assets\\mtt\\user_edid.bin";
 
 // Display adapter class.
 const GUID kDisplayClassGuid = {
@@ -142,14 +155,17 @@ std::string FormatResolutionBlock(uint32_t w, uint32_t h, uint32_t hz)
     return buf;
 }
 
-// Expand logical sizes with rotation @ 60 Hz (and any explicit m.hz); de-dupe.
-// 30 Hz dropped - OpenDisplay targets 60 on this exclusive MTT head.
+// Landscape-only modes @ 60 Hz (and any explicit m.hz); de-dupe.
+// Portrait is Windows Display orientation — listing both WxH and HxW fought
+// hello vs DXGI and made "Keep" resolution useless under mode forcing.
 std::vector<ModeKey> ExpandWanted(const std::vector<MttMode>& wanted)
 {
     std::vector<ModeKey> keys;
     auto add = [&](uint32_t w, uint32_t h, uint32_t hz) {
         if (w == 0 || h == 0 || hz == 0)
             return;
+        if (h > w)
+            std::swap(w, h); // store landscape only
         ModeKey k{w, h, hz};
         if (std::find(keys.begin(), keys.end(), k) == keys.end())
             keys.push_back(k);
@@ -157,13 +173,8 @@ std::vector<ModeKey> ExpandWanted(const std::vector<MttMode>& wanted)
     for (const MttMode& m : wanted) {
         const uint32_t hz = m.hz ? m.hz : 60u;
         add(m.width, m.height, hz);
-        if (m.width != m.height)
-            add(m.height, m.width, hz);
-        if (hz != 60u) {
+        if (hz != 60u)
             add(m.width, m.height, 60u);
-            if (m.width != m.height)
-                add(m.height, m.width, 60u);
-        }
     }
     return keys;
 }
@@ -233,7 +244,7 @@ bool ReloadMttVddDevice(std::string& detail)
     };
 
     auto runPnputilRestart = [](const std::wstring& instanceId, std::string& detailOut) -> bool {
-        std::wstring args = L"/restart-device \"" + instanceId + L"\"";
+        std::wstring args = L"/restart-device "" + instanceId + L""";
         SHELLEXECUTEINFOW sei{};
         sei.cbSize = sizeof(sei);
         sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -326,6 +337,314 @@ bool ReloadMttVddDevice(std::string& detail)
 }
 
 
+
+int ParseMonitorCount(const std::string& xml)
+{
+    const size_t monOpen = xml.find("<monitors>");
+    const size_t monClose = xml.find("</monitors>");
+    if (monOpen == std::string::npos || monClose == std::string::npos || monClose < monOpen)
+        return -1;
+    const std::string block = xml.substr(monOpen, monClose - monOpen);
+    const size_t a = block.find("<count>");
+    const size_t b = block.find("</count>");
+    if (a == std::string::npos || b == std::string::npos || b <= a)
+        return -1;
+    return static_cast<int>(strtol(block.c_str() + a + strlen("<count>"), nullptr, 10));
+}
+
+std::string ReplaceMonitorCountXml(const std::string& xml, uint32_t count)
+{
+    const size_t monOpen = xml.find("<monitors>");
+    const size_t monClose = xml.find("</monitors>");
+    if (monOpen == std::string::npos || monClose == std::string::npos || monClose < monOpen)
+        return {};
+    const size_t blockEnd = monClose + strlen("</monitors>");
+    char body[128];
+    snprintf(body, sizeof(body),
+             "<monitors>\n"
+             "        <count>%u</count>\n"
+             "    </monitors>",
+             count);
+    std::string out = xml;
+    out.replace(monOpen, blockEnd - monOpen, body);
+    return out;
+}
+
+bool WaitForMttMonitor(bool wantPresent, int timeoutMs)
+{
+    ExistingMonitor mon{};
+    int waited = 0;
+    while (waited < timeoutMs) {
+        const bool present = FindMttVirtualMonitor(mon);
+        if (present == wantPresent)
+            return true;
+        Sleep(200);
+        waited += 200;
+    }
+    ExistingMonitor again{};
+    return FindMttVirtualMonitor(again) == wantPresent;
+}
+
+std::wstring AppDataDirW()
+{
+    wchar_t* appData = nullptr;
+    size_t len = 0;
+    std::wstring base;
+    if (_wdupenv_s(&appData, &len, L"APPDATA") == 0 && appData) {
+        base = appData;
+        free(appData);
+    }
+    if (base.empty())
+        base = L".";
+    return base + L"\\opendisplay-win";
+}
+
+std::wstring MttTopologyPathW()
+{
+    return AppDataDirW() + L"\\mtt_display.json";
+}
+
+bool JsonReadIntField(const std::string& json, const char* key, int& out)
+{
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos)
+        return false;
+    pos = json.find(':', pos + needle.size());
+    if (pos == std::string::npos)
+        return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r'))
+        ++pos;
+    char* endp = nullptr;
+    long v = std::strtol(json.c_str() + pos, &endp, 10);
+    if (endp == json.c_str() + pos)
+        return false;
+    out = static_cast<int>(v);
+    return true;
+}
+
+bool JsonReadU32Field(const std::string& json, const char* key, uint32_t& out)
+{
+    int v = 0;
+    if (!JsonReadIntField(json, key, v) || v < 0)
+        return false;
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+
+bool JsonReadStringField(const std::string& json, const char* key, std::string& out)
+{
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos)
+        return false;
+    pos = json.find(':', pos + needle.size());
+    if (pos == std::string::npos)
+        return false;
+    ++pos;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+        ++pos;
+    if (pos >= json.size() || json[pos] != '"')
+        return false;
+    size_t end = json.find('"', pos + 1);
+    if (end == std::string::npos)
+        return false;
+    out.assign(json, pos + 1, end - (pos + 1));
+    return true;
+}
+
+struct MttTopology {
+    int x = 0;
+    int y = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t hz = 0;
+    std::string deviceId;
+    bool valid = false;
+};
+
+bool LoadTopologyFile(MttTopology& out)
+{
+    std::string body;
+    if (!ReadFileUtf8(MttTopologyPathW(), body) || body.empty())
+        return false;
+    int x = 0, y = 0;
+    if (!JsonReadIntField(body, "x", x) || !JsonReadIntField(body, "y", y))
+        return false;
+    uint32_t w = 0, h = 0, hz = 0;
+    (void)JsonReadU32Field(body, "width", w);
+    (void)JsonReadU32Field(body, "height", h);
+    (void)JsonReadU32Field(body, "hz", hz);
+    std::string id;
+    (void)JsonReadStringField(body, "deviceId", id);
+    out = {};
+    out.x = x;
+    out.y = y;
+    out.width = w;
+    out.height = h;
+    out.hz = hz;
+    out.deviceId = std::move(id);
+    out.valid = true;
+    return true;
+}
+
+bool WriteTopologyFile(const MttTopology& t)
+{
+    const std::wstring dir = AppDataDirW();
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::ostringstream ss;
+    ss << "{\n"
+       << "  \"x\": " << t.x << ",\n"
+       << "  \"y\": " << t.y << ",\n"
+       << "  \"width\": " << t.width << ",\n"
+       << "  \"height\": " << t.height << ",\n"
+       << "  \"hz\": " << t.hz << ",\n"
+       << "  \"deviceId\": \"";
+    for (char c : t.deviceId) {
+        if (c == '\\')
+            ss << "\\\\";
+        else if (c != '"')
+            ss << c;
+    }
+    ss << "\"\n}\n";
+    return WriteFileUtf8Atomic(MttTopologyPathW(), ss.str());
+}
+
+struct MttGraceState {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool pending = false;
+    uint64_t epoch = 0;
+    std::string logTag;
+    std::thread worker;
+};
+
+MttGraceState& MttGrace()
+{
+    static MttGraceState g;
+    return g;
+}
+
+
+bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& out)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        return false;
+    in.seekg(0, std::ios::end);
+    const std::streamoff n = in.tellg();
+    if (n <= 0)
+        return false;
+    in.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(n));
+    in.read(reinterpret_cast<char*>(out.data()), n);
+    return static_cast<bool>(in) || in.eof();
+}
+
+bool WriteFileBytesAtomic(const std::wstring& path, const std::vector<uint8_t>& body)
+{
+    const std::wstring tmp = path + L".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out)
+            return false;
+        out.write(reinterpret_cast<const char*>(body.data()), static_cast<std::streamsize>(body.size()));
+        if (!out)
+            return false;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (!CopyFileW(tmp.c_str(), path.c_str(), FALSE)) {
+            DeleteFileW(tmp.c_str());
+            return false;
+        }
+        DeleteFileW(tmp.c_str());
+    }
+    return true;
+}
+
+bool FilesEqual(const std::wstring& a, const std::wstring& b)
+{
+    std::vector<uint8_t> ba, bb;
+    if (!ReadFileBytes(a, ba) || !ReadFileBytes(b, bb))
+        return false;
+    return ba == bb;
+}
+
+std::wstring ExeDirW()
+{
+    wchar_t exe[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
+        return {};
+    std::wstring p(exe);
+    const size_t slash = p.find_last_of(L"\\/");
+    if (slash == std::wstring::npos)
+        return {};
+    return p.substr(0, slash);
+}
+
+std::wstring FindShippedUserEdid()
+{
+    const std::wstring exeDir = ExeDirW();
+    const std::wstring candidates[] = {
+        exeDir + L"\\assets\\mtt\\user_edid.bin",
+        exeDir + L"\\user_edid.bin",
+        kDevEdidPath,
+        kAppsEdidPath,
+        kLiveEdidPath,
+    };
+    for (const std::wstring& c : candidates) {
+        if (!c.empty() && FileExists(c.c_str()))
+            return c;
+    }
+    return {};
+}
+
+
+bool ParseOptionBool(const std::string& xml, const char* tag, bool& out)
+{
+    const std::string open = std::string("<") + tag + ">";
+    const std::string close = std::string("</") + tag + ">";
+    const size_t a = xml.find(open);
+    if (a == std::string::npos)
+        return false;
+    const size_t start = a + open.size();
+    const size_t b = xml.find(close, start);
+    if (b == std::string::npos)
+        return false;
+    std::string v = xml.substr(start, b - start);
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t' || v.front() == '\r' || v.front() == '\n'))
+        v.erase(v.begin());
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '\n'))
+        v.pop_back();
+    if (v == "true" || v == "1") {
+        out = true;
+        return true;
+    }
+    if (v == "false" || v == "0") {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+std::string SetOptionBoolXml(const std::string& xml, const char* tag, bool value)
+{
+    const std::string open = std::string("<") + tag + ">";
+    const std::string close = std::string("</") + tag + ">";
+    const size_t a = xml.find(open);
+    if (a == std::string::npos)
+        return {};
+    const size_t start = a + open.size();
+    const size_t b = xml.find(close, start);
+    if (b == std::string::npos)
+        return {};
+    std::string out = xml;
+    out.replace(start, b - start, value ? "true" : "false");
+    return out;
+}
+
+
 } // namespace
 
 std::wstring FindLiveSettingsPath()
@@ -347,11 +666,157 @@ bool MatchesHelloAspect(uint32_t helloW, uint32_t helloH, uint32_t w, uint32_t h
     return a || b;
 }
 
+
+std::vector<MttMode> BakedMttModes()
+{
+    // Must match assets/mtt/user_edid.bin DTDs (tools/gen_user_edid.py).
+    // Preferred / hello-native first.
+    return {
+        {2352, 1632, 60},
+        {2384, 1664, 60},
+        {1760, 1216, 60},
+        {1168, 816, 60},
+    };
+}
+
+MttEnsureResult EnsureCustomEdid()
+{
+    MttEnsureResult r;
+    r.path = FindLiveSettingsPath();
+    if (r.path.empty()) {
+        r.detail = "live settings missing (expected C:\\VirtualDisplayDriver\\vdd_settings.xml)";
+        return r;
+    }
+
+    const std::wstring shipped = FindShippedUserEdid();
+    if (shipped.empty()) {
+        r.detail = "shipped user_edid.bin not found (assets/mtt/user_edid.bin)";
+        return r;
+    }
+
+    std::string xml;
+    if (!ReadFileUtf8(r.path, xml)) {
+        r.detail = "failed to read live settings";
+        return r;
+    }
+
+    bool changed = false;
+    std::vector<std::string> notes;
+
+    // 1) Install/refresh live user_edid.bin from shipped asset.
+    const bool edidPresent = FileExists(kLiveEdidPath);
+    const bool edidSame = edidPresent && FilesEqual(shipped, kLiveEdidPath);
+    if (!edidSame) {
+        std::vector<uint8_t> bytes;
+        if (!ReadFileBytes(shipped, bytes) || bytes.size() < 128 || (bytes.size() % 128) != 0) {
+            r.detail = "shipped user_edid.bin invalid size";
+            return r;
+        }
+        if (!WriteFileBytesAtomic(kLiveEdidPath, bytes)) {
+            const DWORD err = GetLastError();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "edid write failed (err=%lu)%s",
+                     static_cast<unsigned long>(err),
+                     err == ERROR_ACCESS_DENIED ? " access denied" : "");
+            r.detail = buf;
+            return r;
+        }
+        if (GetFileAttributesW(L"D:\\apps\\VirtualDisplayDriver") != INVALID_FILE_ATTRIBUTES)
+            (void)WriteFileBytesAtomic(kAppsEdidPath, bytes);
+        changed = true;
+        notes.push_back(edidPresent ? "refreshed user_edid.bin" : "installed user_edid.bin");
+    }
+
+    // 2) CustomEdid=true, PreventSpoof=true (stable manufacturer+serial identity).
+    bool custom = false, prevent = false;
+    const bool haveCustom = ParseOptionBool(xml, "CustomEdid", custom);
+    const bool havePrevent = ParseOptionBool(xml, "PreventSpoof", prevent);
+    if (!haveCustom || !custom || !havePrevent || !prevent) {
+        std::string next = xml;
+        if (haveCustom)
+            next = SetOptionBoolXml(next, "CustomEdid", true);
+        if (next.empty()) {
+            r.detail = "malformed XML (no CustomEdid)";
+            return r;
+        }
+        if (havePrevent) {
+            const std::string n2 = SetOptionBoolXml(next, "PreventSpoof", true);
+            if (n2.empty()) {
+                r.detail = "malformed XML (no PreventSpoof)";
+                return r;
+            }
+            next = n2;
+        }
+        if (!WriteFileUtf8Atomic(r.path, next)) {
+            const DWORD err = GetLastError();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "options write failed (err=%lu)%s",
+                     static_cast<unsigned long>(err),
+                     err == ERROR_ACCESS_DENIED ? " access denied" : "");
+            r.detail = buf;
+            return r;
+        }
+        xml = next;
+        changed = true;
+        notes.push_back("CustomEdid=true PreventSpoof=true");
+    }
+
+    // 3) Mirror baked modes into XML <resolutions> (IddCx mode list source).
+    // Do NOT rewrite from hello sizes anymore.
+    const std::vector<ModeKey> need = ExpandWanted(BakedMttModes());
+    const std::vector<ModeKey> present = ParseResolutions(xml);
+    if (!SameModeSet(present, need)) {
+        const std::string rewritten = ReplaceResolutionsXml(xml, need);
+        if (rewritten.empty()) {
+            r.detail = "malformed XML (no <resolutions>)";
+            return r;
+        }
+        if (!WriteFileUtf8Atomic(r.path, rewritten)) {
+            const DWORD err = GetLastError();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "resolutions write failed (err=%lu)%s",
+                     static_cast<unsigned long>(err),
+                     err == ERROR_ACCESS_DENIED ? " access denied" : "");
+            r.detail = buf;
+            return r;
+        }
+        if (FileExists(kAppsSettingsPath) ||
+            GetFileAttributesW(L"D:\\apps\\VirtualDisplayDriver") != INVALID_FILE_ATTRIBUTES)
+            (void)WriteFileUtf8Atomic(kAppsSettingsPath, rewritten);
+        xml = rewritten;
+        changed = true;
+        r.added = static_cast<int>(need.size());
+        notes.push_back("mirrored " + std::to_string(need.size()) + " baked modes into XML");
+    }
+
+    if (!changed) {
+        r.ok = true;
+        r.changed = false;
+        r.detail = "CustomEdid already current (bin+flags+baked modes)";
+        return r;
+    }
+
+    std::string reloadDetail;
+    const bool reloaded = ReloadMttVddDevice(reloadDetail);
+    r.ok = true;
+    r.changed = true;
+    r.detail.clear();
+    for (size_t i = 0; i < notes.size(); ++i) {
+        if (i)
+            r.detail += "; ";
+        r.detail += notes[i];
+    }
+    r.detail += "; " + reloadDetail;
+    if (!reloaded)
+        r.detail += " (reload soft-failed; files written)";
+    return r;
+}
+
 std::vector<MttMode> BuildIpadModeList(uint32_t helloW, uint32_t helloH)
 {
-    // Exclusive OpenDisplay MTT head: only hello-native aspect (+ same-ratio scales).
-    // Other iPad class sizes are kept only when they match hello aspect within ~1%.
-    // Rotations added in ExpandWanted. No 16:9 leftovers (1920x1080 / 2560x1440).
+    // Exclusive OpenDisplay MTT head: landscape hello-native aspect (+ scales).
+    // Other iPad class sizes kept only when aspect matches within ~1%.
+    // No portrait duplicates — Windows Display orientation handles that.
     static const MttMode kCommon[] = {
         {2352, 1632, 60}, // 2360x1640 (11" class)
         {2384, 1664, 60}, // 2388x1668 (newer 11)
@@ -359,10 +824,15 @@ std::vector<MttMode> BuildIpadModeList(uint32_t helloW, uint32_t helloH)
         {2256, 1488, 60}, // 2266x1488 (mini)
     };
 
+    if (helloH > helloW)
+        std::swap(helloW, helloH);
+
     std::vector<MttMode> out;
     auto pushUnique = [&](uint32_t w, uint32_t h) {
         if (w == 0 || h == 0)
             return;
+        if (h > w)
+            std::swap(w, h);
         for (const MttMode& m : out)
             if (m.width == w && m.height == h)
                 return;
@@ -450,11 +920,13 @@ MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted)
 
 bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH)
 {
+    (void)helloW;
+    (void)helloH;
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
         return false;
-    std::wstring args = L"--ensure-mtt-resolutions " + std::to_wstring(helloW) + L" " +
-                        std::to_wstring(helloH);
+    // Legacy name still accepted by main; prefer --ensure-mtt-edid.
+    std::wstring args = L"--ensure-mtt-edid";
 
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof(sei);
@@ -475,42 +947,567 @@ bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH)
 
 bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag)
 {
-    const std::vector<MttMode> list = BuildIpadModeList(helloW, helloH);
-    MttEnsureResult r = EnsureResolutions(list);
+    // Hello sizes are no longer written into XML <resolutions>. Modes + stable
+    // serial live in user_edid.bin (CustomEdid); XML mirrors the baked set.
+    MttEnsureResult r = EnsureCustomEdid();
 
     if (r.ok && !r.changed) {
-        Logf(logTag, "MTT VDD settings: ensured %ux%u@60 (added 0 modes) path=%s\n", helloW, helloH,
+        Logf(logTag, "MTT VDD settings: CustomEdid current for hello %ux%u path=%s\n", helloW, helloH,
              NarrowPath(r.path).c_str());
         return true;
     }
 
     if (!r.ok && r.detail.find("access denied") != std::string::npos) {
-        Logf(logTag, "MTT VDD settings: write needs admin, elevating...\n");
+        Logf(logTag, "MTT VDD settings: CustomEdid write needs admin, elevating...\n");
         if (!SelfElevateEnsure(helloW, helloH)) {
-            Logf(logTag, "MTT VDD settings: elevate failed or UAC declined - modes may be incomplete\n");
+            Logf(logTag, "MTT VDD settings: elevate failed or UAC declined - CustomEdid may be incomplete\n");
             return false;
         }
-        // Re-check after elevated child wrote + reloaded (added count is 0 on no-op re-read).
-        r = EnsureResolutions(list);
+        r = EnsureCustomEdid();
         if (r.ok) {
-            Logf(logTag, "MTT VDD settings: ensured %ux%u@60 (via elevate) path=%s\n", helloW, helloH,
-                 NarrowPath(r.path).c_str());
+            Logf(logTag, "MTT VDD settings: CustomEdid ensured (via elevate) for hello %ux%u path=%s\n", helloW,
+                 helloH, NarrowPath(r.path).c_str());
+            if (!r.detail.empty())
+                Logf(logTag, "MTT VDD settings: %s\n", r.detail.c_str());
             return true;
         }
-        Logf(logTag, "MTT VDD settings: post-elevate still incomplete (%s)\n", r.detail.c_str());
+        Logf(logTag, "MTT VDD settings: post-elevate CustomEdid incomplete (%s)\n", r.detail.c_str());
         return false;
     }
 
     if (r.ok) {
-        Logf(logTag, "MTT VDD settings: ensured %ux%u@60 (added %d modes) path=%s\n", helloW, helloH, r.added,
+        Logf(logTag, "MTT VDD settings: CustomEdid updated for hello %ux%u path=%s\n", helloW, helloH,
              NarrowPath(r.path).c_str());
         if (!r.detail.empty())
             Logf(logTag, "MTT VDD settings: %s\n", r.detail.c_str());
         return true;
     }
 
-    Logf(logTag, "MTT VDD settings: ensure failed (%s)\n", r.detail.c_str());
+    Logf(logTag, "MTT VDD settings: CustomEdid ensure failed (%s)\n", r.detail.c_str());
     return false;
+}
+
+
+
+int ReadMonitorCount()
+{
+    const std::wstring path = FindLiveSettingsPath();
+    if (path.empty())
+        return -1;
+    std::string xml;
+    if (!ReadFileUtf8(path, xml))
+        return -1;
+    return ParseMonitorCount(xml);
+}
+
+MttEnsureResult SetMonitorCount(uint32_t count)
+{
+    MttEnsureResult r;
+    r.path = FindLiveSettingsPath();
+    if (r.path.empty()) {
+        r.detail = "live settings missing (expected C:\\VirtualDisplayDriver\\vdd_settings.xml)";
+        return r;
+    }
+
+    std::string xml;
+    if (!ReadFileUtf8(r.path, xml)) {
+        r.detail = "failed to read live settings";
+        return r;
+    }
+
+    const int cur = ParseMonitorCount(xml);
+    ExistingMonitor attached{};
+    const bool headPresent = FindMttVirtualMonitor(attached);
+
+    if (cur == static_cast<int>(count)) {
+        if (count == 0 && !headPresent) {
+            r.ok = true;
+            r.changed = false;
+            r.detail = "already count=0 (no MTT head)";
+            return r;
+        }
+        if (count >= 1 && headPresent) {
+            r.ok = true;
+            r.changed = false;
+            r.detail = "already count=" + std::to_string(count) + " (MTT head present)";
+            return r;
+        }
+    }
+
+    if (cur != static_cast<int>(count)) {
+        const std::string rewritten = ReplaceMonitorCountXml(xml, count);
+        if (rewritten.empty()) {
+            r.detail = "malformed XML (no <monitors>)";
+            return r;
+        }
+        if (!WriteFileUtf8Atomic(r.path, rewritten)) {
+            const DWORD err = GetLastError();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "write failed (err=%lu)%s",
+                     static_cast<unsigned long>(err),
+                     err == ERROR_ACCESS_DENIED ? " access denied" : "");
+            r.detail = buf;
+            return r;
+        }
+        if (FileExists(kAppsSettingsPath) ||
+            GetFileAttributesW(L"D:\\apps\\VirtualDisplayDriver") != INVALID_FILE_ATTRIBUTES)
+            (void)WriteFileUtf8Atomic(kAppsSettingsPath, rewritten);
+    }
+
+    std::string reloadDetail;
+    const bool reloaded = ReloadMttVddDevice(reloadDetail);
+    bool settled = false;
+    if (count == 0) {
+        settled = WaitForMttMonitor(/*wantPresent=*/false, 4000);
+    } else {
+        // Attached OR merely present (CDS-detachable) is enough; Ensure attaches.
+        settled = WaitForMttMonitor(/*wantPresent=*/true, 3000);
+        if (!settled) {
+            ExistingMonitor any{};
+            settled = FindMttVirtualMonitorDevice(any, /*requireAttached=*/false);
+        }
+    }
+
+    r.changed = true;
+    r.added = 0;
+    char buf[192];
+    snprintf(buf, sizeof(buf), "set monitors count=%u (was %d); %s; settle=%s",
+             count, cur, reloadDetail.c_str(), settled ? "ok" : "timeout");
+    r.detail = buf;
+    if (!reloaded)
+        r.detail += " (reload soft-failed)";
+    r.ok = settled;
+    return r;
+}
+
+bool SelfElevateSetMonitorCount(uint32_t count)
+{
+    wchar_t exe[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
+        return false;
+    std::wstring args = L"--set-mtt-monitor-count " + std::to_wstring(count);
+
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei) || sei.hProcess == nullptr)
+        return false;
+
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(sei.hProcess, &code);
+    CloseHandle(sei.hProcess);
+    return code == 0;
+}
+
+bool EnsureMttVddAttached(const std::string& logTag)
+{
+    CancelPendingMttVddTeardown();
+
+    ExistingMonitor mon{};
+    if (FindMttVirtualMonitor(mon)) {
+        Logf(logTag, "mtt: VDD already attached (%ls)\n", mon.deviceName.c_str());
+        (void)RestoreMttDisplayTopology(logTag);
+        return true;
+    }
+
+    // Make sure the driver is willing to expose a head.
+    MttEnsureResult r = SetMonitorCount(1);
+    if (!r.ok && r.detail.find("access denied") != std::string::npos) {
+        Logf(logTag, "mtt: set count=1 needs admin, elevating...\n");
+        if (!SelfElevateSetMonitorCount(1)) {
+            Logf(logTag, "mtt: elevate failed or UAC declined - VDD may be missing\n");
+            return false;
+        }
+        r = SetMonitorCount(1);
+    }
+
+    if (FindMttVirtualMonitor(mon)) {
+        Logf(logTag, "mtt: VDD attached (%ls) [%s]\n", mon.deviceName.c_str(), r.detail.c_str());
+        (void)RestoreMttDisplayTopology(logTag);
+        return true;
+    }
+
+    // CDS-detached (or not yet on desktop): find the MTT device and attach it.
+    if (FindMttVirtualMonitorDevice(mon, /*requireAttached=*/false)) {
+        // Prefer last saved landscape mode; else hello-native default. Restore
+        // below reasserts position (and mode) from mtt_display.json.
+        uint32_t attachW = 2352, attachH = 1632, attachHz = 60;
+        int attachX = 0, attachY = 0;
+        bool havePos = false;
+        {
+            MttTopology saved{};
+            if (LoadTopologyFile(saved) && saved.valid && saved.width > 0 && saved.height > 0) {
+                attachW = saved.width;
+                attachH = saved.height;
+                if (saved.hz != 0)
+                    attachHz = saved.hz;
+                attachX = saved.x;
+                attachY = saved.y;
+                havePos = true;
+            }
+        }
+        Logf(logTag, "mtt: attaching detached head %ls at %ux%u@%u\n", mon.deviceName.c_str(),
+             attachW, attachH, attachHz);
+        if (AttachMonitorToDesktop(mon.deviceName, attachW, attachH, attachHz, havePos, attachX,
+                                   attachY) &&
+            WaitForMttMonitor(/*wantPresent=*/true, 5000)) {
+            if (FindMttVirtualMonitor(mon)) {
+                Logf(logTag, "mtt: VDD attached via CDS (%ls)\n", mon.deviceName.c_str());
+                (void)RestoreMttDisplayTopology(logTag);
+                return true;
+            }
+        }
+    }
+
+    // If a prior teardown DICS_DISABLE'd the MTT1337 monitor, re-enable it.
+    {
+        static const GUID kMonitorClass = {
+            0x4d36e96e, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+        HDEVINFO devInfo = SetupDiGetClassDevsW(&kMonitorClass, nullptr, nullptr, 0);
+        bool enabled = false;
+        if (devInfo != INVALID_HANDLE_VALUE) {
+            SP_DEVINFO_DATA did{};
+            did.cbSize = sizeof(did);
+            for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &did); ++i) {
+                wchar_t instanceId[256];
+                if (!SetupDiGetDeviceInstanceIdW(devInfo, &did, instanceId, 256, nullptr))
+                    continue;
+                if (wcsstr(instanceId, L"MTT1337") == nullptr)
+                    continue;
+                SP_PROPCHANGE_PARAMS pcp{};
+                pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+                pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+                pcp.StateChange = DICS_ENABLE;
+                pcp.Scope = DICS_FLAG_GLOBAL;
+                pcp.HwProfile = 0;
+                if (SetupDiSetClassInstallParamsW(devInfo, &did, &pcp.ClassInstallHeader, sizeof(pcp)) &&
+                    SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &did))
+                    enabled = true;
+            }
+            SetupDiDestroyDeviceInfoList(devInfo);
+        }
+        if (enabled) {
+            Logf(logTag, "mtt: re-enabled MTT1337 monitor node\n");
+            (void)WaitForMttMonitor(/*wantPresent=*/true, 8000);
+            if (FindMttVirtualMonitorDevice(mon, /*requireAttached=*/false)) {
+                uint32_t aw = 2352, ah = 1632, ahz = 60;
+                int ax = 0, ay = 0;
+                bool hp = false;
+                MttTopology saved{};
+                if (LoadTopologyFile(saved) && saved.valid && saved.width > 0 && saved.height > 0) {
+                    aw = saved.width;
+                    ah = saved.height;
+                    if (saved.hz != 0)
+                        ahz = saved.hz;
+                    ax = saved.x;
+                    ay = saved.y;
+                    hp = true;
+                }
+                (void)AttachMonitorToDesktop(mon.deviceName, aw, ah, ahz, hp, ax, ay);
+                (void)WaitForMttMonitor(/*wantPresent=*/true, 5000);
+            }
+        }
+    }
+
+    if (FindMttVirtualMonitor(mon)) {
+        Logf(logTag, "mtt: VDD attached (%ls) [%s]\n", mon.deviceName.c_str(), r.detail.c_str());
+        (void)RestoreMttDisplayTopology(logTag);
+        return true;
+    }
+    Logf(logTag, "mtt: ensure VDD failed (%s)\n", r.detail.c_str());
+    return false;
+}
+bool TearDownMttVdd(const std::string& logTag)
+{
+    ExistingMonitor mon{};
+    if (!FindMttVirtualMonitor(mon) && ReadMonitorCount() <= 0) {
+        Logf(logTag, "mtt: VDD already down\n");
+        return true;
+    }
+
+    // Prefer CDS detach: reliably removes the head from Display Settings.
+    // Leave monitors/<count> alone so the next hello can CDS-attach without a
+    // driver reload (count=0 + pnputil was slow and flaky to reverse).
+    if (FindMttVirtualMonitor(mon)) {
+        Logf(logTag, "mtt: detaching head %ls from desktop\n", mon.deviceName.c_str());
+        if (!DetachMonitorFromDesktop(mon.deviceName))
+            Logf(logTag, "mtt: CDS detach request failed on %ls\n", mon.deviceName.c_str());
+        (void)WaitForMttMonitor(/*wantPresent=*/false, 4000);
+    }
+
+    MttEnsureResult r;
+    r.ok = !FindMttVirtualMonitor(mon);
+    r.changed = true;
+    r.detail = r.ok ? "cds detach" : "cds detach incomplete";
+
+    if (!FindMttVirtualMonitor(mon)) {
+        Logf(logTag, "mtt: VDD torn down [%s]\n", r.detail.c_str());
+        return true;
+    }
+
+    // Last resort: SetupAPI disable of the MTT1337 monitor node.
+    {
+        static const GUID kMonitorClass = {
+            0x4d36e96e, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+        HDEVINFO devInfo = SetupDiGetClassDevsW(&kMonitorClass, nullptr, nullptr, DIGCF_PRESENT);
+        bool disabled = false;
+        if (devInfo != INVALID_HANDLE_VALUE) {
+            SP_DEVINFO_DATA did{};
+            did.cbSize = sizeof(did);
+            for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &did); ++i) {
+                wchar_t instanceId[256];
+                if (!SetupDiGetDeviceInstanceIdW(devInfo, &did, instanceId, 256, nullptr))
+                    continue;
+                if (wcsstr(instanceId, L"MTT1337") == nullptr)
+                    continue;
+                SP_PROPCHANGE_PARAMS pcp{};
+                pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+                pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+                pcp.StateChange = DICS_DISABLE;
+                pcp.Scope = DICS_FLAG_GLOBAL;
+                pcp.HwProfile = 0;
+                if (SetupDiSetClassInstallParamsW(devInfo, &did, &pcp.ClassInstallHeader, sizeof(pcp)) &&
+                    SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &did))
+                    disabled = true;
+            }
+            SetupDiDestroyDeviceInfoList(devInfo);
+        }
+        if (disabled && WaitForMttMonitor(/*wantPresent=*/false, 4000)) {
+            Logf(logTag, "mtt: VDD torn down via SetupAPI disable [%s]\n", r.detail.c_str());
+            return true;
+        }
+    }
+
+    Logf(logTag, "mtt: teardown failed (still attached) [%s]\n", r.detail.c_str());
+    return false;
+}
+
+void CancelPendingMttVddTeardown()
+{
+    MttGraceState& g = MttGrace();
+    std::thread toJoin;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        ++g.epoch;
+        g.pending = false;
+        g.cv.notify_all();
+        if (g.worker.joinable())
+            toJoin = std::move(g.worker);
+    }
+    if (toJoin.joinable())
+        toJoin.join();
+}
+
+void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason)
+{
+    if (reason == MttTeardownReason::UserInitiated) {
+        CancelPendingMttVddTeardown();
+        Logf(logTag, "mtt: user-initiated teardown\n");
+        (void)SaveMttDisplayTopology(logTag);
+        (void)TearDownMttVdd(logTag);
+        return;
+    }
+
+    MttGraceState& g = MttGrace();
+    uint64_t myEpoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        ++g.epoch;
+        myEpoch = g.epoch;
+        g.pending = true;
+        g.logTag = logTag;
+        g.cv.notify_all();
+    }
+
+    std::thread prev;
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        if (g.worker.joinable())
+            prev = std::move(g.worker);
+    }
+    if (prev.joinable())
+        prev.join();
+
+    {
+        std::lock_guard<std::mutex> lock(g.mu);
+        if (!g.pending || g.epoch != myEpoch)
+            return;
+        Logf(logTag, "mtt: link-loss grace %d ms (sticky VDD)\n", kMttLinkLossGraceMs);
+        g.worker = std::thread([myEpoch]() {
+            MttGraceState& gs = MttGrace();
+            std::string tag;
+            {
+                std::unique_lock<std::mutex> lock(gs.mu);
+                tag = gs.logTag;
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(kMttLinkLossGraceMs);
+                while (gs.pending && gs.epoch == myEpoch) {
+                    if (gs.cv.wait_until(lock, deadline) == std::cv_status::timeout)
+                        break;
+                }
+                if (!gs.pending || gs.epoch != myEpoch) {
+                    Logf(tag.empty() ? "mtt" : tag, "mtt: link-loss grace cancelled\n");
+                    return;
+                }
+                gs.pending = false;
+            }
+            Logf(tag.empty() ? "mtt" : tag, "mtt: link-loss grace expired - tearing down VDD\n");
+            (void)TearDownMttVdd(tag.empty() ? "mtt" : tag);
+        });
+    }
+}
+
+bool SaveMttDisplayTopology(const std::string& logTag)
+{
+    ExistingMonitor mon{};
+    if (!FindMttVirtualMonitor(mon))
+        return false;
+
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    int x = mon.rect.left;
+    int y = mon.rect.top;
+    uint32_t w = 0, h = 0, hz = 0;
+    if (EnumDisplaySettingsW(mon.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm)) {
+        x = dm.dmPosition.x;
+        y = dm.dmPosition.y;
+        w = dm.dmPelsWidth;
+        h = dm.dmPelsHeight;
+        hz = dm.dmDisplayFrequency;
+    } else if (mon.rect.right > mon.rect.left && mon.rect.bottom > mon.rect.top) {
+        w = static_cast<uint32_t>(mon.rect.right - mon.rect.left);
+        h = static_cast<uint32_t>(mon.rect.bottom - mon.rect.top);
+    } else {
+        return false;
+    }
+
+    MttTopology prev{};
+    if (LoadTopologyFile(prev) && prev.x == x && prev.y == y && prev.width == w && prev.height == h &&
+        prev.hz == hz)
+        return true;
+
+    MttTopology t;
+    t.x = x;
+    t.y = y;
+    t.width = w;
+    t.height = h;
+    t.hz = hz;
+    t.deviceId = NarrowPath(mon.deviceId);
+    t.valid = true;
+    if (!WriteTopologyFile(t)) {
+        Logf(logTag, "mtt: failed to save position (%d,%d) %ux%u@%u\n", x, y, w, h, hz);
+        return false;
+    }
+    Logf(logTag, "mtt: saved position (%d,%d) %ux%u@%u\n", x, y, w, h, hz);
+    return true;
+}
+
+bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz)
+{
+    MttTopology t{};
+    if (!LoadTopologyFile(t) || !t.valid || t.width == 0 || t.height == 0)
+        return false;
+    width = t.width;
+    height = t.height;
+    hz = t.hz;
+    return true;
+}
+
+bool RestoreMttDisplayTopology(const std::string& logTag)
+{
+    MttTopology t{};
+    if (!LoadTopologyFile(t) || !t.valid)
+        return false;
+
+    ExistingMonitor mon{};
+    if (!FindMttVirtualMonitor(mon))
+        return false;
+
+    // FindMttVirtualMonitor matched MTT1337 / VDD by MTT (not DISPLAY index).
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    bool haveDm = EnumDisplaySettingsW(mon.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm) != 0;
+
+    bool modeOk = true;
+    if (t.width > 0 && t.height > 0) {
+        const uint32_t applyHz = t.hz ? t.hz : 60u;
+        const bool already =
+            haveDm && dm.dmPelsWidth == t.width && dm.dmPelsHeight == t.height &&
+            (t.hz == 0 || dm.dmDisplayFrequency == static_cast<DWORD>(applyHz)) &&
+            dm.dmDisplayOrientation == DMDO_DEFAULT;
+        if (already) {
+            Logf(logTag, "mtt: restoring saved mode %ux%u@%u (already current)\n", t.width, t.height,
+                 applyHz);
+        } else if (EnsureMonitorMode(mon.deviceName, t.width, t.height, applyHz)) {
+            Logf(logTag, "mtt: restoring saved mode %ux%u@%u\n", t.width, t.height, applyHz);
+            haveDm = EnumDisplaySettingsW(mon.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm) != 0;
+        } else {
+            Logf(logTag, "mtt: restore saved mode %ux%u@%u failed on %ls\n", t.width, t.height, applyHz,
+                 mon.deviceName.c_str());
+            modeOk = false;
+        }
+    }
+
+    bool posOk = true;
+    if (haveDm && dm.dmPosition.x == t.x && dm.dmPosition.y == t.y) {
+        // already there
+    } else if (!SetMonitorDesktopPosition(mon.deviceName, t.x, t.y)) {
+        Logf(logTag, "mtt: restore position (%d,%d) failed on %ls\n", t.x, t.y, mon.deviceName.c_str());
+        posOk = false;
+    } else {
+        Logf(logTag, "mtt: restored position (%d,%d)\n", t.x, t.y);
+    }
+    return modeOk && posOk;
+}
+
+void PollMttDisplayTopology(const std::string& logTag, POINT& lastObserved)
+{
+    ExistingMonitor mon{};
+    if (!FindMttVirtualMonitor(mon))
+        return;
+
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    int x = 0, y = 0;
+    uint32_t w = 0, h = 0, hz = 0;
+    if (EnumDisplaySettingsW(mon.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm)) {
+        x = dm.dmPosition.x;
+        y = dm.dmPosition.y;
+        w = dm.dmPelsWidth;
+        h = dm.dmPelsHeight;
+        hz = dm.dmDisplayFrequency;
+    } else if (GetMonitorRectByDeviceName(mon.deviceName, mon.rect)) {
+        x = mon.rect.left;
+        y = mon.rect.top;
+        w = static_cast<uint32_t>(mon.rect.right - mon.rect.left);
+        h = static_cast<uint32_t>(mon.rect.bottom - mon.rect.top);
+    } else {
+        return;
+    }
+
+    // Track last mode alongside position so Display Settings resolution picks
+    // get persisted even when the head is not dragged.
+    static uint32_t s_lastW = 0, s_lastH = 0, s_lastHz = 0;
+
+    if (lastObserved.x == INT_MIN) {
+        lastObserved = {x, y};
+        s_lastW = w;
+        s_lastH = h;
+        s_lastHz = hz;
+        return;
+    }
+    if (x == lastObserved.x && y == lastObserved.y && w == s_lastW && h == s_lastH && hz == s_lastHz)
+        return;
+    lastObserved = {x, y};
+    s_lastW = w;
+    s_lastH = h;
+    s_lastHz = hz;
+    (void)SaveMttDisplayTopology(logTag);
 }
 
 } // namespace od
