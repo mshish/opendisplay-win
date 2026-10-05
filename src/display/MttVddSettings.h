@@ -70,9 +70,12 @@ MttEnsureResult SetMonitorCount(uint32_t count);
 bool SelfElevateSetMonitorCount(uint32_t count);
 
 // Ensure at least one MTT head is attached (set count>=1 + reload if needed).
-// No-op when a MTT monitor is already on the desktop. Logs via Logf.
-// Cancels any pending link-loss grace teardown. After a fresh CDS attach,
-// reapplies the last saved CCD position (see SaveMttDisplayTopology).
+// Logs via Logf. Cancels any pending link-loss grace teardown.
+// Position policy: the saved layout is applied once per attachment - after a
+// fresh attach by us, or once when adopting a head that was already on the
+// desktop (previous run / reboot). When the head is already attached and was
+// positioned, this is a no-op for layout (ACCESS_LOST / rotate / resize
+// rebuilds must never move the monitor back). Refuses after BeginMttShutdown.
 bool EnsureMttVddAttached(const std::string& logTag);
 
 // Drop MTT heads via CDS detach. Prefer RequestMttVddTeardown so link-loss
@@ -81,7 +84,7 @@ bool TearDownMttVdd(const std::string& logTag);
 
 // How long after link loss (socket drop / transport flap) we keep the MTT head
 // attached waiting for a client hello. Cancelled by EnsureMttVddAttached.
-constexpr int kMttLinkLossGraceMs = 12000;
+constexpr int kMttLinkLossGraceMs = 6000;
 
 enum class MttTeardownReason {
     UserInitiated, // tray Disconnect / Exit / Stop / app quit
@@ -91,7 +94,8 @@ enum class MttTeardownReason {
 // UserInitiated: cancel grace and TearDown now.
 // LinkLoss: start/restart the grace timer; TearDown only if it expires with
 // no intervening Ensure/Cancel (client did not return).
-void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason);
+// graceMs <= 0 uses kMttLinkLossGraceMs.
+void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason, int graceMs = 0);
 
 // Cancel a pending link-loss grace teardown (client returned).
 void CancelPendingMttVddTeardown();
@@ -99,7 +103,15 @@ void CancelPendingMttVddTeardown();
 // Persist the MTT head's current CCD position/mode under
 // %APPDATA%\opendisplay-win\mtt_display.json, keyed by MTT1337 identity (not
 // \\.\DISPLAYn). Logs "mtt: saved position (x,y) WxH@hz".
+// Only saves when the MTT head is attached AND active in the CCD topology with
+// a valid, non-cloned source mode; otherwise (inactive / "Show only on 1",
+// absent, mid-reconfigure) returns false and leaves the file untouched.
 bool SaveMttDisplayTopology(const std::string& logTag);
+
+// Same, but skipped within a short settle window after one of our own display
+// applies (see NoteSelfDisplayChange) so our applies are not treated as user
+// layout changes. Used by ACCESS_LOST, WM_DISPLAYCHANGE and the streaming poll.
+bool SaveMttDisplayTopologyIfUserChange(const std::string& logTag);
 
 // True when mtt_display.json has a usable width x height (hz optional; 0 -> caller
 // picks a default). Does not touch the desktop.
@@ -110,9 +122,21 @@ bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz);
 // "mtt: restored position (x,y)" / "mtt: restoring saved mode WxH@hz".
 bool RestoreMttDisplayTopology(const std::string& logTag);
 
-// If the MTT head's desktop position or mode changed since lastObserved, save
-// and update lastObserved. Used while streaming so Mike's Display Settings
-// drags / resolution picks survive the next reconnect / app run.
+// Save-only observer (never restores): persists Display Settings drags /
+// resolution picks while streaming so they survive the next reconnect / run.
 void PollMttDisplayTopology(const std::string& logTag, POINT& lastObserved);
+
+// Quit / session end: stop any later EnsureMttVddAttached from re-attaching.
+void BeginMttShutdown();
+
+// Quit / WM_ENDSESSION / normal process exit: cancel grace, save layout (if
+// active), tear the MTT head down and persist the detached topology. Safe to
+// call repeatedly; implies BeginMttShutdown.
+bool ShutdownMttVddForExit(const std::string& logTag);
+
+// Tray startup: if an MTT head is already on the desktop (left over from a
+// previous run / reboot), adopt it - the first Ensure applies the saved layout
+// once - and arm a grace teardown so it does not linger without an iPad.
+void AdoptStaleMttHeadAtStartup(const std::string& logTag, int graceMs);
 
 } // namespace od

@@ -945,6 +945,11 @@ std::thread reader([&] {
                     firstFrameWaitLogged = false;
                     Logf(ip, "capture ACCESS_LOST - rebuilding pipeline (new D3D device)\n");
                     gpuNv12Path = false;
+                    // ACCESS_LOST is usually a Display Settings Apply. Persist the
+                    // user's new layout first (only if MTT is attached+active and
+                    // this was not our own apply); the rebuild never re-applies x/y.
+                    if (usingMttVdd)
+                        (void)SaveMttDisplayTopologyIfUserChange(ip);
                     if (!buildPipeline(width, height)) {
                         Logf(ip, "pipeline rebuild after ACCESS_LOST failed, dropping the connection\n");
                         running = false;
@@ -1024,6 +1029,8 @@ std::thread reader([&] {
                     // encoding portrait "fixes" flash but the iPad stays sideways.
                     Logf(ip, "capture is now %ux%u (encoder had %ux%u), rebuilding pipeline\n", dup.Width(),
                          dup.Height(), encoder.Width(), encoder.Height());
+                    if (usingMttVdd)
+                        (void)SaveMttDisplayTopologyIfUserChange(ip);
                     haveGpuDesktopFrame = false;
                     gpuNv12Path = false;
                     waitFirstFrameSince = {};

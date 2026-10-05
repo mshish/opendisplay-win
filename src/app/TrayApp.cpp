@@ -1,8 +1,10 @@
 #include "app/TrayApp.h"
 
 #include "app/Config.h"
+#include "app/Log.h"
 #include "app/SenderApp.h"
 #include "app/resources.h"
+#include "display/MttVddSettings.h"
 #include "net/Mdns.h"
 
 #include <commctrl.h>
@@ -27,6 +29,12 @@ namespace {
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 constexpr UINT kStatusTimerId = 1;
 constexpr UINT kStatusTimerMs = 1000;
+// WM_DISPLAYCHANGE debounce: a Display Settings Apply fires several changes.
+constexpr UINT kDisplayChangeTimerId = 2;
+constexpr UINT kDisplayChangeDebounceMs = 1500;
+// MTT head already on the desktop at tray start (previous run / reboot): keep
+// it this long for the iPad to reconnect, then remove it.
+constexpr int kStaleMttHeadGraceMs = 30000;
 
 enum : UINT {
     IDM_CONNECT = 40001,
@@ -1076,13 +1084,48 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_TIMER:
             if (wParam == kStatusTimerId)
                 UpdateStatus(ctx);
+            else if (wParam == kDisplayChangeTimerId) {
+                KillTimer(hwnd, kDisplayChangeTimerId);
+                // User layout change while the MTT head is attached: persist it
+                // instead of reverting. No-op if MTT is inactive/absent or the
+                // change was one of our own applies.
+                (void)SaveMttDisplayTopologyIfUserChange("display");
+            }
+            return 0;
+
+        case WM_DISPLAYCHANGE:
+            SetTimer(hwnd, kDisplayChangeTimerId, kDisplayChangeDebounceMs, nullptr);
+            return 0;
+
+        case WM_QUERYENDSESSION:
+            return TRUE;
+
+        case WM_ENDSESSION:
+            if (wParam) {
+                // Logoff / shutdown / restart: same teardown as Quit, so the
+                // MTT head does not survive into the next session.
+                Logf("mtt", "session ending - tearing down\n");
+                BeginMttShutdown();
+                KillTimer(hwnd, kStatusTimerId);
+                KillTimer(hwnd, kDisplayChangeTimerId);
+                for (auto& app : ctx->apps)
+                    app->Stop();
+                (void)ShutdownMttVddForExit("exit");
+            }
             return 0;
 
         case WM_DESTROY:
             KillTimer(hwnd, kStatusTimerId);
+            KillTimer(hwnd, kDisplayChangeTimerId);
             Shell_NotifyIconW(NIM_DELETE, &ctx->nid);
+            // Quit: block re-attach from any racing pipeline rebuild, stop the
+            // senders (a streaming one tears down as user-initiated), then tear
+            // down unconditionally - covers idle/connecting senders and a
+            // pending link-loss grace, which previously left the head behind.
+            BeginMttShutdown();
             for (auto& app : ctx->apps)
                 app->Stop();
+            (void)ShutdownMttVddForExit("exit");
             PostQuitMessage(0);
             return 0;
     }
@@ -1093,6 +1136,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 int RunTray(HINSTANCE hInstance)
 {
+    // One tray per session. A second tray would adopt / tear down the MTT head
+    // the first one is streaming to. Wait briefly so a self-relaunch
+    // (RelaunchElevated) can take over once the old instance has exited.
+    HANDLE trayMutex = CreateMutexW(nullptr, FALSE, L"Local\\opendisplay-win-tray");
+    if (trayMutex == nullptr) {
+        Logf("tray", "another opendisplay-win tray is running (mutex unavailable) - exiting\n");
+        return 0;
+    }
+    const DWORD w = WaitForSingleObject(trayMutex, 10000);
+    if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
+        Logf("tray", "another opendisplay-win tray is running - exiting\n");
+        CloseHandle(trayMutex);
+        return 0;
+    }
+
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_TAB_CLASSES};
     InitCommonControlsEx(&icc);
 
@@ -1108,8 +1166,11 @@ int RunTray(HINSTANCE hInstance)
     wc.lpszClassName = kWndClass;
     RegisterClassExW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, kWndClass, L"opendisplay-win", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInstance,
-                                nullptr);
+    // Hidden top-level window (not HWND_MESSAGE): message-only windows never
+    // receive broadcasts, and we need WM_ENDSESSION (teardown on logoff /
+    // shutdown) and WM_DISPLAYCHANGE (save user layout changes).
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, kWndClass, L"opendisplay-win", WS_POPUP, 0, 0, 0, 0, nullptr,
+                                nullptr, hInstance, nullptr);
     if (hwnd == nullptr)
         return 1;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&ctx));
@@ -1132,6 +1193,8 @@ int RunTray(HINSTANCE hInstance)
     ctx.discoveryRunning = true;
     ctx.discovery = std::thread([&ctx] { RunDiscovery(&ctx); });
 
+    AdoptStaleMttHeadAtStartup("mtt", kStaleMttHeadGraceMs);
+
     if (ctx.cfg.autoReconnect)
         for (size_t i = 0; i < ctx.apps.size(); ++i)
             ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port);
@@ -1146,6 +1209,11 @@ int RunTray(HINSTANCE hInstance)
     ctx.discoveryRunning = false;
     if (ctx.discovery.joinable())
         ctx.discovery.join();
+
+    // Normal process exit safety net (idempotent after WM_DESTROY).
+    for (auto& app : ctx.apps)
+        app->Stop();
+    (void)ShutdownMttVddForExit("exit");
 
     DestroyIcon(ctx.iconGreen);
     DestroyIcon(ctx.iconRed);

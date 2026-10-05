@@ -44,6 +44,11 @@ void RedirectLogToFile(const std::string& name)
     freopen_s(&f, "NUL", "w", stdout);
     freopen_s(&f, "NUL", "w", stderr);
 
+    // Keep the previous run's log (e.g. what Quit / session end did) as
+    // log.prev.txt instead of truncating it away.
+    if (name == "log.txt")
+        (void)MoveFileExA(logPath.c_str(), (dir + "\\log.prev.txt").c_str(), MOVEFILE_REPLACE_EXISTING);
+
     HANDLE h = CreateFileA(logPath.c_str(), GENERIC_WRITE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);

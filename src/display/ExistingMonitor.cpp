@@ -1,5 +1,6 @@
 #include "display/ExistingMonitor.h"
 
+#include <atomic>
 #include <cwchar>
 
 namespace od {
@@ -16,7 +17,27 @@ bool DeviceLooksLikeMtt(const DISPLAY_DEVICEW& dev)
     return false;
 }
 
+std::atomic<uint64_t> g_selfChangeTick{0};
+std::atomic<uint64_t> g_selfChangeGen{0};
+
 } // namespace
+
+void NoteSelfDisplayChange()
+{
+    g_selfChangeTick.store(GetTickCount64());
+    g_selfChangeGen.fetch_add(1);
+}
+
+bool RecentSelfDisplayChange(uint32_t withinMs)
+{
+    const uint64_t t = g_selfChangeTick.load();
+    return t != 0 && GetTickCount64() - t < withinMs;
+}
+
+uint64_t SelfDisplayChangeGeneration()
+{
+    return g_selfChangeGen.load();
+}
 
 bool GetMonitorRectByDeviceName(const std::wstring& deviceName, RECT& out)
 {
@@ -126,12 +147,14 @@ bool AttachMonitorToDesktop(const std::wstring& deviceName, uint32_t width, uint
         dm.dmFields |= DM_BITSPERPEL;
     }
 
+    NoteSelfDisplayChange();
     const LONG staged =
         ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr,
                                  CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
     if (staged != DISP_CHANGE_SUCCESSFUL && staged != DISP_CHANGE_RESTART)
         return false;
     const LONG applied = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    NoteSelfDisplayChange();
     return applied == DISP_CHANGE_SUCCESSFUL || applied == DISP_CHANGE_RESTART;
 }
 
@@ -148,12 +171,14 @@ bool SetMonitorDesktopPosition(const std::wstring& deviceName, int posX, int pos
     dm.dmPosition.x = posX;
     dm.dmPosition.y = posY;
     dm.dmFields = DM_POSITION;
+    NoteSelfDisplayChange();
     const LONG staged =
         ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr,
                                  CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
     if (staged != DISP_CHANGE_SUCCESSFUL && staged != DISP_CHANGE_RESTART)
         return false;
     const LONG applied = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    NoteSelfDisplayChange();
     return applied == DISP_CHANGE_SUCCESSFUL || applied == DISP_CHANGE_RESTART;
 }
 
@@ -170,7 +195,9 @@ bool EnsureMonitorRefresh(const std::wstring& deviceName, uint32_t fps)
         return true;
     dm.dmDisplayFrequency = static_cast<DWORD>(fps);
     dm.dmFields = DM_DISPLAYFREQUENCY;
+    NoteSelfDisplayChange();
     const LONG r = ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+    NoteSelfDisplayChange();
     return r == DISP_CHANGE_SUCCESSFUL;
 }
 
@@ -197,7 +224,9 @@ bool EnsureMonitorMode(const std::wstring& deviceName, uint32_t width, uint32_t 
         dm.dmDisplayFrequency = static_cast<DWORD>(fps);
         dm.dmFields |= DM_DISPLAYFREQUENCY;
     }
+    NoteSelfDisplayChange();
     const LONG r = ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+    NoteSelfDisplayChange();
     return r == DISP_CHANGE_SUCCESSFUL;
 }
 
@@ -211,7 +240,9 @@ bool EnsureMonitorLandscapeOrientation(const std::wstring& deviceName)
         return true;
     dm.dmDisplayOrientation = DMDO_DEFAULT;
     dm.dmFields = DM_DISPLAYORIENTATION;
+    NoteSelfDisplayChange();
     const LONG r = ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
+    NoteSelfDisplayChange();
     return r == DISP_CHANGE_SUCCESSFUL;
 }
 
@@ -229,12 +260,14 @@ bool DetachMonitorFromDesktop(const std::wstring& deviceName)
     dm.dmPelsHeight = 0;
     dm.dmPosition.x = 0;
     dm.dmPosition.y = 0;
+    NoteSelfDisplayChange();
     const LONG staged =
         ChangeDisplaySettingsExW(deviceName.c_str(), &dm, nullptr,
                                  CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
     if (staged != DISP_CHANGE_SUCCESSFUL && staged != DISP_CHANGE_RESTART)
         return false;
     const LONG applied = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    NoteSelfDisplayChange();
     return applied == DISP_CHANGE_SUCCESSFUL || applied == DISP_CHANGE_RESTART;
 }
 } // namespace od

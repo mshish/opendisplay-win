@@ -645,6 +645,198 @@ std::string SetOptionBoolXml(const std::string& xml, const char* tag, bool value
 }
 
 
+
+// ---- MTT topology policy state ------------------------------------------
+// Serializes attach / restore / save / teardown across sender threads, the
+// grace worker and the tray thread. Recursive: Ensure -> Restore, user
+// teardown -> Save -> TearDown. Never hold it while joining the grace worker
+// (the worker takes it inside TearDown).
+std::recursive_mutex& MttTopoMutex()
+{
+    static std::recursive_mutex mu;
+    return mu;
+}
+
+// True once the saved position has been applied to the current MTT head
+// attachment (real CDS attach by us, or one-time adoption of a head that was
+// already on the desktop, e.g. left over from a previous run / reboot). Reset
+// when we tear the head down. While true, nothing re-applies x/y: ACCESS_LOST,
+// rotate/resize rebuilds and hello-again all leave the user's layout alone.
+std::atomic<bool> g_mttPositionedThisAttach{false};
+
+// Set on Quit / session end: EnsureMttVddAttached must not re-attach the head
+// from a racing pipeline rebuild while we are tearing it down for exit.
+std::atomic<bool> g_mttShuttingDown{false};
+
+// Our own topology applies (attach, restore) stamp NoteSelfDisplayChange();
+// observers ignore display changes within this window.
+constexpr uint32_t kSelfApplySettleMs = 2000;
+
+struct ActiveDisplayInfo {
+    std::wstring gdiName;
+    RECT rect{};
+    uint32_t sourceId = 0;
+    LUID adapter{};
+    uint32_t hzNum = 0, hzDen = 0;
+};
+
+// Active CCD paths with a valid source mode (desktop rects in physical px).
+bool QueryActiveDisplays(std::vector<ActiveDisplayInfo>& out)
+{
+    out.clear();
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    LONG rc = ERROR_INSUFFICIENT_BUFFER;
+    for (int tries = 0; tries < 4 && rc == ERROR_INSUFFICIENT_BUFFER; ++tries) {
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS)
+            return false;
+        paths.resize(np);
+        modes.resize(nm);
+        rc = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr);
+        if (rc == ERROR_SUCCESS) {
+            paths.resize(np);
+            modes.resize(nm);
+        }
+    }
+    if (rc != ERROR_SUCCESS)
+        return false;
+    for (const auto& p : paths) {
+        if (!(p.flags & DISPLAYCONFIG_PATH_ACTIVE))
+            continue;
+        const UINT32 idx = p.sourceInfo.modeInfoIdx;
+        if (idx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || idx >= modes.size() ||
+            modes[idx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE)
+            continue;
+        const DISPLAYCONFIG_SOURCE_MODE& sm = modes[idx].sourceMode;
+        if (sm.width == 0 || sm.height == 0)
+            continue;
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME sn{};
+        sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        sn.header.size = sizeof(sn);
+        sn.header.adapterId = p.sourceInfo.adapterId;
+        sn.header.id = p.sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS)
+            continue;
+        ActiveDisplayInfo d;
+        d.gdiName = sn.viewGdiDeviceName;
+        d.rect.left = sm.position.x;
+        d.rect.top = sm.position.y;
+        d.rect.right = sm.position.x + static_cast<LONG>(sm.width);
+        d.rect.bottom = sm.position.y + static_cast<LONG>(sm.height);
+        d.sourceId = p.sourceInfo.id;
+        d.adapter = p.sourceInfo.adapterId;
+        d.hzNum = p.targetInfo.refreshRate.Numerator;
+        d.hzDen = p.targetInfo.refreshRate.Denominator;
+        out.push_back(std::move(d));
+    }
+    return true;
+}
+
+bool RectsOverlap(const RECT& a, const RECT& b)
+{
+    return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+// MTT head attached AND active in the CCD topology with a valid, non-cloned
+// source mode. Fills the live rect. This is the gate for every save: when the
+// user picked "Show only on 1" (MTT inactive) or the head is absent / mid
+// reconfigure, we must never overwrite the good saved position.
+bool QueryMttActiveRect(const std::wstring& gdiName, RECT& rect, std::string* why)
+{
+    std::vector<ActiveDisplayInfo> act;
+    if (!QueryActiveDisplays(act)) {
+        if (why)
+            *why = "QueryDisplayConfig failed";
+        return false;
+    }
+    const ActiveDisplayInfo* mtt = nullptr;
+    for (const auto& d : act) {
+        if (_wcsicmp(d.gdiName.c_str(), gdiName.c_str()) == 0) {
+            mtt = &d;
+            break;
+        }
+    }
+    if (!mtt) {
+        if (why)
+            *why = "MTT not active in topology";
+        return false;
+    }
+    for (const auto& d : act) {
+        if (&d == mtt)
+            continue;
+        const bool sameSource = d.sourceId == mtt->sourceId && d.adapter.LowPart == mtt->adapter.LowPart &&
+                                d.adapter.HighPart == mtt->adapter.HighPart;
+        if (sameSource || RectsOverlap(d.rect, mtt->rect)) {
+            if (why)
+                *why = "MTT cloned/overlapping another display";
+            return false;
+        }
+    }
+    rect = mtt->rect;
+    return true;
+}
+
+// Would placing the MTT head at (x,y) with w x h overlap another active
+// display? Then Windows would reshuffle the layout ("position reset").
+bool SavedRectOverlapsOthers(const std::wstring& mttGdiName, int x, int y, uint32_t w, uint32_t h)
+{
+    if (w == 0 || h == 0)
+        return false;
+    std::vector<ActiveDisplayInfo> act;
+    if (!QueryActiveDisplays(act))
+        return false;
+    RECT want{x, y, x + static_cast<LONG>(w), y + static_cast<LONG>(h)};
+    for (const auto& d : act) {
+        if (!mttGdiName.empty() && _wcsicmp(d.gdiName.c_str(), mttGdiName.c_str()) == 0)
+            continue;
+        if (RectsOverlap(d.rect, want))
+            return true;
+    }
+    return false;
+}
+
+// Re-commit the current active topology (MTT already detached) to the CCD
+// persistence database so Windows does not re-extend the MTT head on the next
+// display re-enumeration / reboot. CDS_UPDATEREGISTRY alone only updates the
+// legacy registry view.
+bool PersistActiveTopologyToDatabase(std::string& detail)
+{
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    LONG rc = ERROR_INSUFFICIENT_BUFFER;
+    for (int tries = 0; tries < 4 && rc == ERROR_INSUFFICIENT_BUFFER; ++tries) {
+        UINT32 np = 0, nm = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) {
+            detail = "GetDisplayConfigBufferSizes failed";
+            return false;
+        }
+        paths.resize(np);
+        modes.resize(nm);
+        rc = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr);
+        if (rc == ERROR_SUCCESS) {
+            paths.resize(np);
+            modes.resize(nm);
+        }
+    }
+    if (rc != ERROR_SUCCESS || paths.empty()) {
+        detail = "QueryDisplayConfig failed rc=" + std::to_string(rc);
+        return false;
+    }
+    NoteSelfDisplayChange();
+    const LONG sr = SetDisplayConfig(static_cast<UINT32>(paths.size()), paths.data(),
+                                     static_cast<UINT32>(modes.size()), modes.data(),
+                                     SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE |
+                                         SDC_ALLOW_CHANGES);
+    NoteSelfDisplayChange();
+    if (sr != ERROR_SUCCESS) {
+        detail = "SetDisplayConfig(SAVE_TO_DATABASE) rc=" + std::to_string(sr);
+        return false;
+    }
+    detail = "topology saved to CCD database";
+    return true;
+}
+
 } // namespace
 
 std::wstring FindLiveSettingsPath()
@@ -1106,12 +1298,31 @@ bool SelfElevateSetMonitorCount(uint32_t count)
 
 bool EnsureMttVddAttached(const std::string& logTag)
 {
+    if (g_mttShuttingDown.load()) {
+        Logf(logTag, "mtt: exiting - not attaching VDD\n");
+        return false;
+    }
+    // Join any grace worker BEFORE taking the topology lock (it locks in TearDown).
     CancelPendingMttVddTeardown();
+    std::lock_guard<std::recursive_mutex> topoLock(MttTopoMutex());
+    if (g_mttShuttingDown.load())
+        return false;
 
     ExistingMonitor mon{};
     if (FindMttVirtualMonitor(mon)) {
-        Logf(logTag, "mtt: VDD already attached (%ls)\n", mon.deviceName.c_str());
-        (void)RestoreMttDisplayTopology(logTag);
+        // Already on the desktop. Position is applied at most once per
+        // attachment: if we have not positioned this head yet (left over from a
+        // previous run / reboot, or re-extended outside the app) adopt it and
+        // apply the saved layout once. Otherwise (ACCESS_LOST / rotate / resize
+        // rebuild, hello-again, link-flap reconnect) leave the user's layout
+        // alone - re-applying here is what snapped Display Settings moves back.
+        if (!g_mttPositionedThisAttach.exchange(true)) {
+            Logf(logTag, "mtt: adopting MTT head already on the desktop (%ls) - applying saved layout once\n",
+                 mon.deviceName.c_str());
+            (void)RestoreMttDisplayTopology(logTag);
+        } else {
+            Logf(logTag, "mtt: VDD already attached (%ls) - keeping current layout\n", mon.deviceName.c_str());
+        }
         return true;
     }
 
@@ -1128,6 +1339,7 @@ bool EnsureMttVddAttached(const std::string& logTag)
 
     if (FindMttVirtualMonitor(mon)) {
         Logf(logTag, "mtt: VDD attached (%ls) [%s]\n", mon.deviceName.c_str(), r.detail.c_str());
+        g_mttPositionedThisAttach = true;
         (void)RestoreMttDisplayTopology(logTag);
         return true;
     }
@@ -1151,13 +1363,19 @@ bool EnsureMttVddAttached(const std::string& logTag)
                 havePos = true;
             }
         }
-        Logf(logTag, "mtt: attaching detached head %ls at %ux%u@%u\n", mon.deviceName.c_str(),
-             attachW, attachH, attachHz);
+        if (havePos && SavedRectOverlapsOthers(mon.deviceName, attachX, attachY, attachW, attachH)) {
+            Logf(logTag, "mtt: saved position (%d,%d) overlaps another display - letting Windows place the head\n",
+                 attachX, attachY);
+            havePos = false;
+        }
+        Logf(logTag, "mtt: attaching detached head %ls at %ux%u@%u%s\n", mon.deviceName.c_str(),
+             attachW, attachH, attachHz, havePos ? " (saved position)" : "");
         if (AttachMonitorToDesktop(mon.deviceName, attachW, attachH, attachHz, havePos, attachX,
                                    attachY) &&
             WaitForMttMonitor(/*wantPresent=*/true, 5000)) {
             if (FindMttVirtualMonitor(mon)) {
                 Logf(logTag, "mtt: VDD attached via CDS (%ls)\n", mon.deviceName.c_str());
+                g_mttPositionedThisAttach = true;
                 (void)RestoreMttDisplayTopology(logTag);
                 return true;
             }
@@ -1206,7 +1424,7 @@ bool EnsureMttVddAttached(const std::string& logTag)
                         ahz = saved.hz;
                     ax = saved.x;
                     ay = saved.y;
-                    hp = true;
+                    hp = !SavedRectOverlapsOthers(mon.deviceName, ax, ay, aw, ah);
                 }
                 (void)AttachMonitorToDesktop(mon.deviceName, aw, ah, ahz, hp, ax, ay);
                 (void)WaitForMttMonitor(/*wantPresent=*/true, 5000);
@@ -1216,6 +1434,7 @@ bool EnsureMttVddAttached(const std::string& logTag)
 
     if (FindMttVirtualMonitor(mon)) {
         Logf(logTag, "mtt: VDD attached (%ls) [%s]\n", mon.deviceName.c_str(), r.detail.c_str());
+        g_mttPositionedThisAttach = true;
         (void)RestoreMttDisplayTopology(logTag);
         return true;
     }
@@ -1224,6 +1443,7 @@ bool EnsureMttVddAttached(const std::string& logTag)
 }
 bool TearDownMttVdd(const std::string& logTag)
 {
+    std::lock_guard<std::recursive_mutex> topoLock(MttTopoMutex());
     ExistingMonitor mon{};
     if (!FindMttVirtualMonitor(mon) && ReadMonitorCount() <= 0) {
         Logf(logTag, "mtt: VDD already down\n");
@@ -1247,6 +1467,15 @@ bool TearDownMttVdd(const std::string& logTag)
 
     if (!FindMttVirtualMonitor(mon)) {
         Logf(logTag, "mtt: VDD torn down [%s]\n", r.detail.c_str());
+        g_mttPositionedThisAttach = false;
+        // Make the detach stick: commit the MTT-less topology to the CCD
+        // database, otherwise Windows may re-extend the head on the next
+        // display re-enumeration or reboot ("still connected after exit").
+        std::string persist;
+        if (PersistActiveTopologyToDatabase(persist))
+            Logf(logTag, "mtt: %s\n", persist.c_str());
+        else
+            Logf(logTag, "mtt: persist detached topology failed (%s)\n", persist.c_str());
         return true;
     }
 
@@ -1279,6 +1508,7 @@ bool TearDownMttVdd(const std::string& logTag)
         }
         if (disabled && WaitForMttMonitor(/*wantPresent=*/false, 4000)) {
             Logf(logTag, "mtt: VDD torn down via SetupAPI disable [%s]\n", r.detail.c_str());
+            g_mttPositionedThisAttach = false;
             return true;
         }
     }
@@ -1303,8 +1533,10 @@ void CancelPendingMttVddTeardown()
         toJoin.join();
 }
 
-void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason)
+void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason, int graceMs)
 {
+    if (graceMs <= 0)
+        graceMs = kMttLinkLossGraceMs;
     if (reason == MttTeardownReason::UserInitiated) {
         CancelPendingMttVddTeardown();
         Logf(logTag, "mtt: user-initiated teardown\n");
@@ -1337,15 +1569,15 @@ void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason)
         std::lock_guard<std::mutex> lock(g.mu);
         if (!g.pending || g.epoch != myEpoch)
             return;
-        Logf(logTag, "mtt: link-loss grace %d ms (sticky VDD)\n", kMttLinkLossGraceMs);
-        g.worker = std::thread([myEpoch]() {
+        Logf(logTag, "mtt: link-loss grace %d ms (sticky VDD)\n", graceMs);
+        g.worker = std::thread([myEpoch, graceMs]() {
             MttGraceState& gs = MttGrace();
             std::string tag;
             {
                 std::unique_lock<std::mutex> lock(gs.mu);
                 tag = gs.logTag;
                 const auto deadline = std::chrono::steady_clock::now() +
-                                      std::chrono::milliseconds(kMttLinkLossGraceMs);
+                                      std::chrono::milliseconds(graceMs);
                 while (gs.pending && gs.epoch == myEpoch) {
                     if (gs.cv.wait_until(lock, deadline) == std::cv_status::timeout)
                         break;
@@ -1364,31 +1596,50 @@ void RequestMttVddTeardown(const std::string& logTag, MttTeardownReason reason)
 
 bool SaveMttDisplayTopology(const std::string& logTag)
 {
+    std::lock_guard<std::recursive_mutex> topoLock(MttTopoMutex());
+    static std::string s_lastSkip; // log each distinct skip reason once (poll runs every 2s)
+
     ExistingMonitor mon{};
     if (!FindMttVirtualMonitor(mon))
+        return false; // absent / detached ("Show only on 1"): keep the good saved layout
+
+    // Only save when the head is attached AND active in the CCD topology with a
+    // valid, non-cloned source mode. Anything else (inactive, mid-reconfigure,
+    // duplicated) would overwrite a good saved position with junk.
+    RECT live{};
+    std::string why;
+    if (!QueryMttActiveRect(mon.deviceName, live, &why)) {
+        if (why != s_lastSkip) {
+            Logf(logTag, "mtt: not saving layout (%s)\n", why.c_str());
+            s_lastSkip = why;
+        }
         return false;
+    }
+    s_lastSkip.clear();
+
+    const int x = live.left;
+    const int y = live.top;
+    uint32_t w = static_cast<uint32_t>(live.right - live.left);
+    uint32_t h = static_cast<uint32_t>(live.bottom - live.top);
+    uint32_t hz = 0;
+
+    MttTopology prev{};
+    const bool havePrev = LoadTopologyFile(prev) && prev.valid;
 
     DEVMODEW dm{};
     dm.dmSize = sizeof(dm);
-    int x = mon.rect.left;
-    int y = mon.rect.top;
-    uint32_t w = 0, h = 0, hz = 0;
     if (EnumDisplaySettingsW(mon.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm)) {
-        x = dm.dmPosition.x;
-        y = dm.dmPosition.y;
-        w = dm.dmPelsWidth;
-        h = dm.dmPelsHeight;
         hz = dm.dmDisplayFrequency;
-    } else if (mon.rect.right > mon.rect.left && mon.rect.bottom > mon.rect.top) {
-        w = static_cast<uint32_t>(mon.rect.right - mon.rect.left);
-        h = static_cast<uint32_t>(mon.rect.bottom - mon.rect.top);
-    } else {
-        return false;
+        if (dm.dmDisplayOrientation != DMDO_DEFAULT && havePrev && prev.width && prev.height) {
+            // Restore always applies landscape; keep the last landscape mode and
+            // only take the new position from a rotated head.
+            w = prev.width;
+            h = prev.height;
+            hz = prev.hz;
+        }
     }
 
-    MttTopology prev{};
-    if (LoadTopologyFile(prev) && prev.x == x && prev.y == y && prev.width == w && prev.height == h &&
-        prev.hz == hz)
+    if (havePrev && prev.x == x && prev.y == y && prev.width == w && prev.height == h && prev.hz == hz)
         return true;
 
     MttTopology t;
@@ -1407,6 +1658,16 @@ bool SaveMttDisplayTopology(const std::string& logTag)
     return true;
 }
 
+bool SaveMttDisplayTopologyIfUserChange(const std::string& logTag)
+{
+    // A change that lands right after one of our own applies (attach / restore
+    // / mode fix) is ours, not the user's - the streaming poll picks up any
+    // genuine user change once the settle window has passed.
+    if (RecentSelfDisplayChange(kSelfApplySettleMs))
+        return false;
+    return SaveMttDisplayTopology(logTag);
+}
+
 bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz)
 {
     MttTopology t{};
@@ -1420,6 +1681,7 @@ bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz)
 
 bool RestoreMttDisplayTopology(const std::string& logTag)
 {
+    std::lock_guard<std::recursive_mutex> topoLock(MttTopoMutex());
     MttTopology t{};
     if (!LoadTopologyFile(t) || !t.valid)
         return false;
@@ -1454,8 +1716,15 @@ bool RestoreMttDisplayTopology(const std::string& logTag)
     }
 
     bool posOk = true;
+    const uint32_t curW = haveDm ? dm.dmPelsWidth : t.width;
+    const uint32_t curH = haveDm ? dm.dmPelsHeight : t.height;
     if (haveDm && dm.dmPosition.x == t.x && dm.dmPosition.y == t.y) {
         // already there
+    } else if (SavedRectOverlapsOthers(mon.deviceName, t.x, t.y, curW, curH)) {
+        // e.g. a stale (0,0) would land on top of the primary and Windows
+        // would reshuffle everything - keep Windows' placement instead.
+        Logf(logTag, "mtt: saved position (%d,%d) overlaps another display - keeping current placement\n",
+             t.x, t.y);
     } else if (!SetMonitorDesktopPosition(mon.deviceName, t.x, t.y)) {
         Logf(logTag, "mtt: restore position (%d,%d) failed on %ls\n", t.x, t.y, mon.deviceName.c_str());
         posOk = false;
@@ -1467,47 +1736,47 @@ bool RestoreMttDisplayTopology(const std::string& logTag)
 
 void PollMttDisplayTopology(const std::string& logTag, POINT& lastObserved)
 {
+    // Save-only observer: never restores. SaveMttDisplayTopology no-ops when
+    // nothing changed vs mtt_display.json and refuses inactive/absent heads.
+    if (SaveMttDisplayTopologyIfUserChange(logTag)) {
+        ExistingMonitor mon{};
+        RECT r{};
+        if (FindMttVirtualMonitor(mon) && QueryMttActiveRect(mon.deviceName, r, nullptr))
+            lastObserved = {r.left, r.top};
+    }
+}
+
+void BeginMttShutdown()
+{
+    g_mttShuttingDown = true;
+}
+
+bool ShutdownMttVddForExit(const std::string& logTag)
+{
+    g_mttShuttingDown = true;
+    CancelPendingMttVddTeardown(); // outside the topology lock (joins grace worker)
+    std::lock_guard<std::recursive_mutex> topoLock(MttTopoMutex());
+    ExistingMonitor mon{};
+    if (!FindMttVirtualMonitor(mon)) {
+        Logf(logTag, "mtt: exit - no MTT head on the desktop\n");
+        return true;
+    }
+    Logf(logTag, "mtt: exit - tearing down MTT head %ls\n", mon.deviceName.c_str());
+    (void)SaveMttDisplayTopology(logTag);
+    return TearDownMttVdd(logTag);
+}
+
+void AdoptStaleMttHeadAtStartup(const std::string& logTag, int graceMs)
+{
     ExistingMonitor mon{};
     if (!FindMttVirtualMonitor(mon))
         return;
-
-    DEVMODEW dm{};
-    dm.dmSize = sizeof(dm);
-    int x = 0, y = 0;
-    uint32_t w = 0, h = 0, hz = 0;
-    if (EnumDisplaySettingsW(mon.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &dm)) {
-        x = dm.dmPosition.x;
-        y = dm.dmPosition.y;
-        w = dm.dmPelsWidth;
-        h = dm.dmPelsHeight;
-        hz = dm.dmDisplayFrequency;
-    } else if (GetMonitorRectByDeviceName(mon.deviceName, mon.rect)) {
-        x = mon.rect.left;
-        y = mon.rect.top;
-        w = static_cast<uint32_t>(mon.rect.right - mon.rect.left);
-        h = static_cast<uint32_t>(mon.rect.bottom - mon.rect.top);
-    } else {
-        return;
-    }
-
-    // Track last mode alongside position so Display Settings resolution picks
-    // get persisted even when the head is not dragged.
-    static uint32_t s_lastW = 0, s_lastH = 0, s_lastHz = 0;
-
-    if (lastObserved.x == INT_MIN) {
-        lastObserved = {x, y};
-        s_lastW = w;
-        s_lastH = h;
-        s_lastHz = hz;
-        return;
-    }
-    if (x == lastObserved.x && y == lastObserved.y && w == s_lastW && h == s_lastH && hz == s_lastHz)
-        return;
-    lastObserved = {x, y};
-    s_lastW = w;
-    s_lastH = h;
-    s_lastHz = hz;
-    (void)SaveMttDisplayTopology(logTag);
+    Logf(logTag,
+         "mtt: MTT head %ls already on the desktop at startup (left over from a previous run) - "
+         "adopting; removed in %d ms unless an iPad connects\n",
+         mon.deviceName.c_str(), graceMs);
+    g_mttPositionedThisAttach = false; // first Ensure applies the saved layout once
+    RequestMttVddTeardown(logTag, MttTeardownReason::LinkLoss, graceMs);
 }
 
 } // namespace od

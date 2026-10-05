@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <string>
 
 namespace od {
@@ -54,5 +55,13 @@ bool EnsureMonitorLandscapeOrientation(const std::wstring& deviceName);
 // Best-effort: unplug a GDI device from the desktop (zeroed mode + apply).
 // Used when MTT settings count=0 still leaves a head attached after reload.
 bool DetachMonitorFromDesktop(const std::wstring& deviceName);
+
+// Self-apply guard. Every display change *we* issue (CDS / SetDisplayConfig)
+// stamps a tick so topology observers (ACCESS_LOST, WM_DISPLAYCHANGE, the
+// streaming poll) can tell our own applies from a layout change the user made
+// in Display Settings. Generation increments on every stamp.
+void NoteSelfDisplayChange();
+bool RecentSelfDisplayChange(uint32_t withinMs);
+uint64_t SelfDisplayChangeGeneration();
 
 } // namespace od
