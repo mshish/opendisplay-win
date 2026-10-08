@@ -27,6 +27,8 @@ namespace od {
 namespace {
 
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
+// Sender thread -> tray: show a balloon. lParam = heap std::wstring (deleted here).
+constexpr UINT WM_APP_NOTIFY = WM_APP + 2;
 constexpr UINT kStatusTimerId = 1;
 constexpr UINT kStatusTimerMs = 1000;
 // WM_DISPLAYCHANGE debounce: a Display Settings Apply fires several changes.
@@ -1042,6 +1044,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     auto* ctx = reinterpret_cast<TrayContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 
     switch (msg) {
+        case WM_APP_NOTIFY: {
+            std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
+            if (text && ctx) {
+                NOTIFYICONDATAW info = ctx->nid;
+                info.uFlags = NIF_INFO;
+                info.dwInfoFlags = NIIF_INFO;
+                wcsncpy_s(info.szInfoTitle, L"OpenDisplay", _TRUNCATE);
+                wcsncpy_s(info.szInfo, text->c_str(), _TRUNCATE);
+                Shell_NotifyIconW(NIM_MODIFY, &info);
+            }
+            return 0;
+        }
+
         case WM_APP_TRAY:
             if (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU)
                 ShowContextMenu(hwnd, ctx);
@@ -1115,6 +1130,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case WM_DESTROY:
+            SetMttUserNotifier(nullptr);
             KillTimer(hwnd, kStatusTimerId);
             KillTimer(hwnd, kDisplayChangeTimerId);
             Shell_NotifyIconW(NIM_DELETE, &ctx->nid);
@@ -1192,6 +1208,14 @@ int RunTray(HINSTANCE hInstance)
 
     ctx.discoveryRunning = true;
     ctx.discovery = std::thread([&ctx] { RunDiscovery(&ctx); });
+
+    // One-time notice right before an EDID-change UAC prompt (sender thread ->
+    // tray thread via PostMessage).
+    SetMttUserNotifier([hwnd](const std::wstring& text) {
+        auto* copy = new std::wstring(text);
+        if (!PostMessageW(hwnd, WM_APP_NOTIFY, 0, reinterpret_cast<LPARAM>(copy)))
+            delete copy;
+    });
 
     AdoptStaleMttHeadAtStartup("mtt", kStaleMttHeadGraceMs);
 

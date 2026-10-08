@@ -290,6 +290,9 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     // MTT-only: capture + QSV share the Intel VDD. No Parsec fallback.
     bool usingMttVdd = false;
     bool mttModesEnsured = false; // once per connection; Ensure is idempotent too
+    // Raw hello pixelsWide/High (unaligned): the per-iPad EDID is generated
+    // from the panel size the iPad reports, not the 16-aligned capture size.
+    uint32_t mttHelloW = 0, mttHelloH = 0;
     bool mttHelloModeForced = false; // force hello WxH once; later honor Keep
     ExistingMonitor mttMon{};
     // Updated once the dial settles (USB vs Wi-Fi); buildPipeline / reconfigure read these.
@@ -301,6 +304,18 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // Caller holds pipelineMutex.
         dup.Close();
 
+        // Per-iPad EDID BEFORE the head attaches: modes generated from this
+        // hello size (first build of a connection = hello WxH). Same iPad
+        // again = no-op; a size change self-elevates once (tray notice first)
+        // and reloads MttVDD. UAC decline keeps the installed EDID and still
+        // connects. Never re-run on capture rebuilds.
+        if (!mttModesEnsured) {
+            const uint32_t edidW = mttHelloW ? mttHelloW : width;
+            const uint32_t edidH = mttHelloH ? mttHelloH : height;
+            (void)EnsureMttResolutionsForHello(edidW, edidH, ip);
+            mttModesEnsured = true; // even on UAC decline: one prompt per connection
+        }
+
         // Re-attach MTT head if a prior last-client teardown dropped it.
         Logf(ip, "mtt: ensuring VDD for hello\n");
         (void)EnsureMttVddAttached(ip);
@@ -308,16 +323,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         if (usingMttVdd) {
             Logf(ip, "using MTT virtual monitor %ls (%ls)\n",
                  mttMon.deviceName.c_str(), mttMon.deviceString.c_str());
-            // Ensure CustomEdid + shipped user_edid.bin (baked landscape modes + stable serial).
-            // Does not auto-switch the desktop mode - user picks in Display Settings.
-            if (!mttModesEnsured) {
-                EnsureMttResolutionsForHello(width, height, ip);
-                mttModesEnsured = true; // even on UAC decline: one prompt per connection
-            }
-            // First hello of a connection: restore saved topology mode when
-            // present (Mike's Display Settings pick). Only force hello-native
-            // on first-ever attach (no mtt_display.json mode yet). Later
-            // rebuilds honor Keep and only fix orientation / refresh.
+            // First hello of a connection: restore the saved mode (the user's
+            // Display Settings pick) only if this iPad's EDID offers it;
+            // otherwise the preferred mode. Later rebuilds honor Keep and only
+            // fix orientation / refresh.
             if (!mttHelloModeForced) {
                 uint32_t savedW = 0, savedH = 0, savedHz = 0;
                 if (QueryMttSavedMode(savedW, savedH, savedHz)) {
@@ -333,16 +342,20 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         Logf(ip, "mtt: restoring saved mode %ux%u@%u\n", savedW, savedH, applyHz);
                     }
                 } else {
-                    if (!EnsureMonitorMode(mttMon.deviceName, width, height, kFps)) {
-                        Logf(ip, "mtt: no saved mode - forcing hello native %ux%u failed "
+                    // No saved mode, or it is not offered by this iPad's EDID:
+                    // use the preferred (landscape hello-native) mode.
+                    const MttMode preferred = CurrentMttModes().front();
+                    if (!EnsureMonitorMode(mttMon.deviceName, preferred.width, preferred.height, kFps)) {
+                        Logf(ip, "mtt: no usable saved mode - preferred %ux%u failed "
                                  "(keeping current)\n",
-                             width, height);
+                             preferred.width, preferred.height);
                         if (!EnsureMonitorRefresh(mttMon.deviceName, kFps))
                             Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", kFps);
                         else
                             Logf(ip, "MTT refresh set to %u Hz\n", kFps);
                     } else {
-                        Logf(ip, "mtt: no saved mode - forcing hello native %ux%u\n", width, height);
+                        Logf(ip, "mtt: no usable saved mode - using preferred %ux%u\n", preferred.width,
+                             preferred.height);
                     }
                 }
                 mttHelloModeForced = true;
@@ -565,6 +578,8 @@ while (!stopRequested_) {
         uint32_t width = Align16Clamp(hello.pixelsWide, 1920);
         uint32_t height = Align16Clamp(hello.pixelsHigh, 1080);
         Logf(ip, "hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
+        mttHelloW = hello.pixelsWide > 0 ? static_cast<uint32_t>(hello.pixelsWide) : 0;
+        mttHelloH = hello.pixelsHigh > 0 ? static_cast<uint32_t>(hello.pixelsHigh) : 0;
 
         // Only iPads of the panel size that is already on the air may join (see
         // AcquirePanel). A different one hangs up and keeps checking back, so

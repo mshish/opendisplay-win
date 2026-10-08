@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <io.h>
 #include <string>
@@ -103,6 +104,26 @@ LONG WINAPI CrashLogger(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER; // let the process terminate
 }
 
+// "WxH" in argv[i], or "W H" in argv[i], argv[i+1]. False if absent/invalid.
+bool ParseHelloSizeArgs(int argc, char** argv, int i, uint32_t& w, uint32_t& h)
+{
+    if (i >= argc)
+        return false;
+    unsigned long a = 0, b = 0;
+    char* end = nullptr;
+    a = strtoul(argv[i], &end, 10);
+    if (end && (*end == 'x' || *end == 'X')) {
+        b = strtoul(end + 1, nullptr, 10);
+    } else if (i + 1 < argc) {
+        b = strtoul(argv[i + 1], nullptr, 10);
+    }
+    if (a == 0 || b == 0 || a > 16384 || b > 16384)
+        return false;
+    w = static_cast<uint32_t>(a);
+    h = static_cast<uint32_t>(b);
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -128,6 +149,7 @@ int main(int argc, char** argv)
     std::string command = argc >= 2 ? argv[1] : "";
     bool oneOff = command == "--browse-mdns" ||
                   command == "--ensure-mtt-resolutions" || command == "--ensure-mtt-edid" ||
+                  command == "--dump-mtt-edid" ||
                   command == "--set-mtt-monitor-count" ||
                   command == "--teardown-mtt-vdd" || command == "--ensure-mtt-vdd";
 
@@ -161,15 +183,51 @@ int main(int argc, char** argv)
     int rc = 0;
     if ((argc >= 2 && std::string(argv[1]) == "--ensure-mtt-edid") ||
                (argc >= 2 && std::string(argv[1]) == "--ensure-mtt-resolutions")) {
-        // Elevated one-off: install shipped user_edid.bin, set CustomEdid=true,
-        // mirror baked landscape modes into XML, reload MttVDD. Hello WxH args
-        // (legacy --ensure-mtt-resolutions) are ignored for the mode list.
-        od::MttEnsureResult r = od::EnsureCustomEdid();
+        // Elevated one-off (SelfElevateEnsure): with a hello size WxH, generate
+        // that iPad's EDID + XML modes; without, install the shipped
+        // user_edid.bin. Sets CustomEdid/PreventSpoof, reloads MttVDD only if
+        // something changed.
+        uint32_t helloW = 0, helloH = 0;
+        od::MttEnsureResult r = ParseHelloSizeArgs(argc, argv, 2, helloW, helloH)
+                                    ? od::EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/false)
+                                    : od::EnsureCustomEdid();
         const bool ok = r.ok;
         printf("ensure-mtt-edid: %s (added %d, changed=%d) path=%ls detail=%s\n",
                ok ? "ok" : "failed", r.added, r.changed ? 1 : 0, r.path.c_str(), r.detail.c_str());
         rc = ok ? 0 : 1;
 
+    } else if (argc >= 2 && std::string(argv[1]) == "--dump-mtt-edid") {
+        // Diagnostics (no admin, touches nothing): --dump-mtt-edid WxH [out.bin]
+        // prints the generated mode list and writes the EDID bytes, for
+        // byte-comparison with tools/gen_user_edid.py --size WxH.
+        uint32_t helloW = 0, helloH = 0;
+        if (!ParseHelloSizeArgs(argc, argv, 2, helloW, helloH)) {
+            printf("usage: --dump-mtt-edid WxH [out.bin]\n");
+            rc = 1;
+        } else {
+            const std::vector<od::MttMode> modes = od::MttModesForHello(helloW, helloH);
+            const std::vector<uint8_t> edid = od::BuildMttEdid(modes);
+            printf("%ux%u:", helloW, helloH);
+            for (size_t i = 0; i < modes.size(); ++i)
+                printf("%s %ux%u@%u", i ? "," : "", modes[i].width, modes[i].height, modes[i].hz);
+            printf("\n");
+            const bool sizeIsOneArg = strchr(argv[2], 'x') != nullptr || strchr(argv[2], 'X') != nullptr;
+            const int outIdx = sizeIsOneArg ? 3 : 4;
+            if (edid.size() != 128) {
+                printf("EDID generation failed\n");
+                rc = 1;
+            } else if (outIdx < argc) {
+                FILE* f = nullptr;
+                if (fopen_s(&f, argv[outIdx], "wb") == 0 && f) {
+                    fwrite(edid.data(), 1, edid.size(), f);
+                    fclose(f);
+                    printf("wrote %s (128 bytes)\n", argv[outIdx]);
+                } else {
+                    printf("cannot write %s\n", argv[outIdx]);
+                    rc = 1;
+                }
+            }
+        }
     } else if (argc >= 3 && std::string(argv[1]) == "--set-mtt-monitor-count") {
         // Elevated one-shot: set <monitors><count> in live MTT settings and reload.
         // Invoked by SelfElevateSetMonitorCount (ensure/teardown path).

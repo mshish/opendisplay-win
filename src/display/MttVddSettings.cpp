@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -833,6 +834,332 @@ bool PersistActiveTopologyToDatabase(std::string& detail)
 
 } // namespace
 
+// ---- Runtime EDID: single source of MTT modes ----------------------------
+// MttModesForHello is the ONE place the MTT mode list comes from: EDID DTDs,
+// XML <resolutions>, attach defaults and BakedMttModes (shipped fallback) all
+// derive from it. tools/gen_user_edid.py (modes_for_size / build_edid) is the
+// byte-identical reference implementation - keep them in lockstep.
+namespace {
+
+constexpr uint32_t kDefaultHelloW = 2360; // shipped fallback (11" class)
+constexpr uint32_t kDefaultHelloH = 1640;
+constexpr uint32_t kMttRefresh = 60;
+constexpr uint32_t kEdidMaxDim = 4095; // DTD 12-bit active fields
+
+struct IpadPanel {
+    uint32_t w, h;
+};
+// Native iPad panels (landscape); sibling candidates after 16-floor.
+constexpr IpadPanel kIpadPanels[] = {
+    {2360, 1640}, // 10.9" / 11" Air, iPad 10th
+    {2388, 1668}, // 11" Pro (pre-M4), 11" Air M2
+    {2420, 1668}, // 11" Pro M4
+    {2732, 2048}, // 12.9" Pro, 13" Air
+    {2752, 2064}, // 13" Pro M4
+    {2266, 1488}, // mini 6/7
+    {2160, 1620}, // 10.2"
+    {2224, 1668}, // 10.5" Pro
+    {2048, 1536}, // 9.7" / older
+};
+
+// Physical size: 2352 px -> 225 mm (~265 ppi). Keeps the shipped 225x156 mm.
+constexpr uint32_t kMmNum = 225;
+constexpr uint32_t kMmDen = 2352;
+
+constexpr uint8_t kEdidManufacturer[2] = {0x36, 0x94}; // "MTT"
+constexpr uint16_t kEdidProduct = 0x1337;
+constexpr uint32_t kEdidSerial = 0x4F445731; // "ODW1"
+constexpr uint8_t kEdidWeek = 1;
+constexpr uint32_t kEdidYear = 2026;
+
+uint32_t Align16Floor(uint32_t v)
+{
+    return v & ~15u;
+}
+
+uint32_t PhysicalMm(uint32_t px)
+{
+    return (px * kMmNum + kMmDen / 2) / kMmDen;
+}
+
+struct CvtTiming {
+    uint32_t clock10khz = 0;
+    uint32_t hActive = 0, hBlank = 0, hFront = 0, hSync = 0;
+    uint32_t vActive = 0, vBlank = 0, vFront = 0, vSync = 0;
+};
+
+// Port of gen_user_edid.py cvt_rb_params: fixed CVT-RB-ish horizontal
+// blanking, search v_back so the 10 kHz pixel clock lands closest to refresh.
+// Python round() is half-to-even; reproduced exactly with integer math.
+bool CvtRbTiming(uint32_t hActive, uint32_t vActive, uint32_t refresh, CvtTiming& out)
+{
+    const uint32_t hFront = 48, hSync = 32, hBlank = 160;
+    const uint32_t vFront = 3, vSync = 10;
+    const uint64_t hTotal = hActive + hBlank;
+    bool have = false;
+    double bestErr = 0.0;
+    for (uint32_t vBack = 6; vBack < 120; ++vBack) {
+        const uint32_t vBlank = vFront + vSync + vBack;
+        const uint64_t vTotal = static_cast<uint64_t>(vActive) + vBlank;
+        const uint64_t n = hTotal * vTotal * refresh;
+        uint64_t q = n / 10000;
+        const uint64_t r = n % 10000;
+        if (r > 5000 || (r == 5000 && (q & 1)))
+            ++q;
+        if (q < 1 || q > 65535)
+            continue;
+        const double actual = (static_cast<double>(q) * 10000.0) / static_cast<double>(hTotal * vTotal);
+        const double err = std::fabs(actual - static_cast<double>(refresh));
+        if (!have || err < bestErr) {
+            have = true;
+            bestErr = err;
+            out.clock10khz = static_cast<uint32_t>(q);
+            out.hActive = hActive;
+            out.hBlank = hBlank;
+            out.hFront = hFront;
+            out.hSync = hSync;
+            out.vActive = vActive;
+            out.vBlank = vBlank;
+            out.vFront = vFront;
+            out.vSync = vSync;
+            if (err < 0.01)
+                break;
+        }
+    }
+    return have;
+}
+
+void PackDetailedTiming(const CvtTiming& p, uint32_t hMm, uint32_t vMm, uint8_t* b)
+{
+    b[0] = static_cast<uint8_t>(p.clock10khz & 0xFF);
+    b[1] = static_cast<uint8_t>((p.clock10khz >> 8) & 0xFF);
+    b[2] = static_cast<uint8_t>(p.hActive & 0xFF);
+    b[3] = static_cast<uint8_t>(p.hBlank & 0xFF);
+    b[4] = static_cast<uint8_t>(((p.hActive >> 8) << 4) | ((p.hBlank >> 8) & 0x0F));
+    b[5] = static_cast<uint8_t>(p.vActive & 0xFF);
+    b[6] = static_cast<uint8_t>(p.vBlank & 0xFF);
+    b[7] = static_cast<uint8_t>(((p.vActive >> 8) << 4) | ((p.vBlank >> 8) & 0x0F));
+    b[8] = static_cast<uint8_t>(p.hFront & 0xFF);
+    b[9] = static_cast<uint8_t>(p.hSync & 0xFF);
+    b[10] = static_cast<uint8_t>(((p.vFront & 0x0F) << 4) | (p.vSync & 0x0F));
+    b[11] = static_cast<uint8_t>(((p.hFront >> 8) << 6) | ((p.hSync >> 8) << 4) | ((p.vFront >> 4) << 2) |
+                                 ((p.vSync >> 4) & 0x03));
+    b[12] = static_cast<uint8_t>(hMm & 0xFF);
+    b[13] = static_cast<uint8_t>(vMm & 0xFF);
+    b[14] = static_cast<uint8_t>(((hMm >> 8) << 4) | ((vMm >> 8) & 0x0F));
+    b[15] = 0;
+    b[16] = 0;
+    b[17] = 0x1E; // digital separate sync, +h +v
+}
+
+std::mutex& NotifierMutex()
+{
+    static std::mutex mu;
+    return mu;
+}
+
+std::function<void(const std::wstring&)>& NotifierFn()
+{
+    static std::function<void(const std::wstring&)> fn;
+    return fn;
+}
+
+void NotifyUser(const std::wstring& text)
+{
+    std::function<void(const std::wstring&)> fn;
+    {
+        std::lock_guard<std::mutex> lock(NotifierMutex());
+        fn = NotifierFn();
+    }
+    if (fn)
+        fn(text);
+}
+
+bool ProcessIsElevated()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    TOKEN_ELEVATION elev{};
+    DWORD len = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &elev, sizeof(elev), &len) != FALSE;
+    CloseHandle(token);
+    return ok && elev.TokenIsElevated != 0;
+}
+
+std::string FormatModes(const std::vector<MttMode>& modes)
+{
+    std::string s;
+    for (const MttMode& m : modes) {
+        if (!s.empty())
+            s += ", ";
+        s += std::to_string(m.width) + "x" + std::to_string(m.height) + "@" + std::to_string(m.hz);
+    }
+    return s;
+}
+
+bool ModeOffered(const std::vector<MttMode>& offered, uint32_t w, uint32_t h)
+{
+    if (h > w)
+        std::swap(w, h);
+    for (const MttMode& m : offered)
+        if (m.width == w && m.height == h)
+            return true;
+    return false;
+}
+
+} // namespace
+
+std::vector<MttMode> MttModesForHello(uint32_t helloW, uint32_t helloH)
+{
+    uint32_t w = helloW, h = helloH;
+    if (h > w)
+        std::swap(w, h); // always landscape: long side first
+    w = Align16Floor(w);
+    h = Align16Floor(h);
+    if (w < 16 || h < 16 || w > kEdidMaxDim || h > kEdidMaxDim) {
+        if (helloW == kDefaultHelloW && helloH == kDefaultHelloH)
+            return {};
+        return MttModesForHello(kDefaultHelloW, kDefaultHelloH);
+    }
+
+    std::vector<MttMode> out;
+    auto push = [&](uint32_t mw, uint32_t mh, bool native) {
+        if (mh > mw)
+            std::swap(mw, mh);
+        if (!native && (mw < 640 || mh < 480))
+            return;
+        for (const MttMode& m : out)
+            if (m.width == mw && m.height == mh)
+                return;
+        out.push_back({mw, mh, kMttRefresh});
+    };
+
+    push(w, h, true);
+
+    // Closest-aspect sibling panel: aspect within 1%, width within 8%.
+    bool haveBest = false;
+    uint64_t bestDiff = 0, bestPh = 0;
+    uint32_t bestPw = 0;
+    for (const IpadPanel& panel : kIpadPanels) {
+        const uint32_t pw = Align16Floor(panel.w), ph = Align16Floor(panel.h);
+        if (pw == w && ph == h)
+            continue;
+        const int64_t cross = static_cast<int64_t>(pw) * h - static_cast<int64_t>(w) * ph;
+        const uint64_t diff = static_cast<uint64_t>(cross < 0 ? -cross : cross);
+        if (100 * diff > static_cast<uint64_t>(w) * ph)
+            continue;
+        const uint32_t dw = pw > w ? pw - w : w - pw;
+        if (100ull * dw > 8ull * w)
+            continue;
+        if (!haveBest || diff * bestPh < bestDiff * ph) {
+            haveBest = true;
+            bestDiff = diff;
+            bestPh = ph;
+            bestPw = pw;
+        }
+    }
+    if (haveBest)
+        push(bestPw, static_cast<uint32_t>(bestPh), false);
+
+    push(Align16Floor(w * 3 / 4), Align16Floor(h * 3 / 4), false);
+    push(Align16Floor(w / 2), Align16Floor(h / 2), false);
+    if (out.size() > 4)
+        out.resize(4);
+    return out;
+}
+
+std::vector<uint8_t> BuildMttEdid(const std::vector<MttMode>& modes)
+{
+    if (modes.empty() || modes.size() > 4)
+        return {};
+    const uint32_t hMm = PhysicalMm(modes[0].width);
+    const uint32_t vMm = PhysicalMm(modes[0].height);
+
+    std::vector<uint8_t> e(128, 0);
+    static const uint8_t kHeader[8] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    memcpy(e.data(), kHeader, 8);
+    e[8] = kEdidManufacturer[0];
+    e[9] = kEdidManufacturer[1];
+    e[10] = static_cast<uint8_t>(kEdidProduct & 0xFF);
+    e[11] = static_cast<uint8_t>(kEdidProduct >> 8);
+    e[12] = static_cast<uint8_t>(kEdidSerial & 0xFF);
+    e[13] = static_cast<uint8_t>((kEdidSerial >> 8) & 0xFF);
+    e[14] = static_cast<uint8_t>((kEdidSerial >> 16) & 0xFF);
+    e[15] = static_cast<uint8_t>((kEdidSerial >> 24) & 0xFF);
+    e[16] = kEdidWeek;
+    e[17] = static_cast<uint8_t>(kEdidYear - 1990);
+    e[18] = 0x01; // EDID 1.3
+    e[19] = 0x03;
+    e[20] = 0x80; // digital input
+    e[21] = static_cast<uint8_t>(std::max<uint32_t>(1, hMm / 10)); // cm
+    e[22] = static_cast<uint8_t>(std::max<uint32_t>(1, vMm / 10));
+    e[23] = 0x78; // gamma 2.2
+    e[24] = 0x0A; // preferred timing mode, RGB
+    static const uint8_t kChroma[10] = {0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54};
+    memcpy(e.data() + 25, kChroma, 10);
+    // 35..37: no established timings (zero). 38..53: standard timings unused.
+    for (size_t i = 38; i < 54; ++i)
+        e[i] = 0x01;
+
+    for (size_t slot = 0; slot < 4; ++slot) {
+        uint8_t* d = e.data() + 54 + slot * 18;
+        if (slot < modes.size()) {
+            CvtTiming t;
+            if (!CvtRbTiming(modes[slot].width, modes[slot].height, modes[slot].hz ? modes[slot].hz : kMttRefresh,
+                             t))
+                return {};
+            PackDetailedTiming(t, hMm, vMm, d);
+        } else if (slot == modes.size()) {
+            static const char kName[] = "OpenDisplay\n";
+            d[3] = 0xFC; // monitor name
+            memset(d + 5, ' ', 13);
+            memcpy(d + 5, kName, sizeof(kName) - 1);
+        } else {
+            d[3] = 0x10; // dummy descriptor
+        }
+    }
+
+    e[126] = 0; // no extensions
+    uint32_t sum = 0;
+    for (size_t i = 0; i < 127; ++i)
+        sum += e[i];
+    e[127] = static_cast<uint8_t>((256 - (sum % 256)) % 256);
+    return e;
+}
+
+std::vector<MttMode> BakedMttModes()
+{
+    // Shipped fallback (assets/mtt/user_edid.bin) = the 11" default hello size.
+    return MttModesForHello(kDefaultHelloW, kDefaultHelloH);
+}
+
+std::vector<MttMode> CurrentMttModes()
+{
+    std::string xml;
+    const std::wstring path = FindLiveSettingsPath();
+    std::vector<MttMode> out;
+    if (!path.empty() && ReadFileUtf8(path, xml)) {
+        for (const ModeKey& k : ParseResolutions(xml)) {
+            uint32_t w = k.w, h = k.h;
+            if (h > w)
+                std::swap(w, h);
+            if (!ModeOffered(out, w, h))
+                out.push_back({w, h, k.hz ? k.hz : kMttRefresh});
+        }
+    }
+    if (out.empty())
+        out = BakedMttModes();
+    return out;
+}
+
+void SetMttUserNotifier(std::function<void(const std::wstring&)> fn)
+{
+    std::lock_guard<std::mutex> lock(NotifierMutex());
+    NotifierFn() = std::move(fn);
+}
+
+
 std::wstring FindLiveSettingsPath()
 {
     if (FileExists(kLiveSettingsPath))
@@ -840,32 +1167,14 @@ std::wstring FindLiveSettingsPath()
     return {};
 }
 
-bool MatchesHelloAspect(uint32_t helloW, uint32_t helloH, uint32_t w, uint32_t h)
-{
-    if (helloW == 0 || helloH == 0 || w == 0 || h == 0)
-        return false;
-    const double target = static_cast<double>(helloW) / static_cast<double>(helloH);
-    const double r1 = static_cast<double>(w) / static_cast<double>(h);
-    const double r2 = static_cast<double>(h) / static_cast<double>(w);
-    const bool a = std::fabs(r1 - target) / target <= 0.01;
-    const bool b = std::fabs(r2 - target) / target <= 0.01;
-    return a || b;
-}
+namespace {
 
-
-std::vector<MttMode> BakedMttModes()
-{
-    // Must match assets/mtt/user_edid.bin DTDs (tools/gen_user_edid.py).
-    // Preferred / hello-native first.
-    return {
-        {2352, 1632, 60},
-        {2384, 1664, 60},
-        {1760, 1216, 60},
-        {1168, 816, 60},
-    };
-}
-
-MttEnsureResult EnsureCustomEdid()
+// Install `edid` as C:\VirtualDisplayDriver\user_edid.bin, set CustomEdid /
+// PreventSpoof, mirror `modes` (in order, preferred first) into XML
+// <resolutions>, reload MttVDD if anything changed. dryRun: only report
+// whether something would change (r.changed) - never writes, never reloads.
+MttEnsureResult EnsureCustomEdidBytes(const std::vector<uint8_t>& edid, const std::vector<MttMode>& modes,
+                                      bool dryRun)
 {
     MttEnsureResult r;
     r.path = FindLiveSettingsPath();
@@ -873,10 +1182,8 @@ MttEnsureResult EnsureCustomEdid()
         r.detail = "live settings missing (expected C:\\VirtualDisplayDriver\\vdd_settings.xml)";
         return r;
     }
-
-    const std::wstring shipped = FindShippedUserEdid();
-    if (shipped.empty()) {
-        r.detail = "shipped user_edid.bin not found (assets/mtt/user_edid.bin)";
+    if (edid.size() < 128 || (edid.size() % 128) != 0 || modes.empty()) {
+        r.detail = "invalid EDID / mode list";
         return r;
     }
 
@@ -886,29 +1193,24 @@ MttEnsureResult EnsureCustomEdid()
         return r;
     }
 
-    bool changed = false;
     std::vector<std::string> notes;
+    auto writeFail = [&](const char* what) {
+        const DWORD err = GetLastError();
+        char buf[112];
+        snprintf(buf, sizeof(buf), "%s write failed (err=%lu)%s", what, static_cast<unsigned long>(err),
+                 err == ERROR_ACCESS_DENIED ? " access denied" : "");
+        r.detail = buf;
+        return r;
+    };
 
-    // 1) Install/refresh live user_edid.bin from shipped asset.
-    const bool edidPresent = FileExists(kLiveEdidPath);
-    const bool edidSame = edidPresent && FilesEqual(shipped, kLiveEdidPath);
+    // 1) user_edid.bin bytes.
+    std::vector<uint8_t> live;
+    const bool edidPresent = ReadFileBytes(kLiveEdidPath, live);
+    const bool edidSame = edidPresent && live == edid;
     if (!edidSame) {
-        std::vector<uint8_t> bytes;
-        if (!ReadFileBytes(shipped, bytes) || bytes.size() < 128 || (bytes.size() % 128) != 0) {
-            r.detail = "shipped user_edid.bin invalid size";
-            return r;
-        }
-        if (!WriteFileBytesAtomic(kLiveEdidPath, bytes)) {
-            const DWORD err = GetLastError();
-            char buf[96];
-            snprintf(buf, sizeof(buf), "edid write failed (err=%lu)%s",
-                     static_cast<unsigned long>(err),
-                     err == ERROR_ACCESS_DENIED ? " access denied" : "");
-            r.detail = buf;
-            return r;
-        }
-        changed = true;
-        notes.push_back(edidPresent ? "refreshed user_edid.bin" : "installed user_edid.bin");
+        notes.push_back(edidPresent ? "user_edid.bin differs" : "user_edid.bin missing");
+        if (!dryRun && !WriteFileBytesAtomic(kLiveEdidPath, edid))
+            return writeFail("edid");
     }
 
     // 2) CustomEdid=true, PreventSpoof=true (stable manufacturer+serial identity).
@@ -916,6 +1218,7 @@ MttEnsureResult EnsureCustomEdid()
     const bool haveCustom = ParseOptionBool(xml, "CustomEdid", custom);
     const bool havePrevent = ParseOptionBool(xml, "PreventSpoof", prevent);
     if (!haveCustom || !custom || !havePrevent || !prevent) {
+        notes.push_back("CustomEdid/PreventSpoof flags");
         std::string next = xml;
         if (haveCustom)
             next = SetOptionBoolXml(next, "CustomEdid", true);
@@ -931,107 +1234,76 @@ MttEnsureResult EnsureCustomEdid()
             }
             next = n2;
         }
-        if (!WriteFileUtf8Atomic(r.path, next)) {
-            const DWORD err = GetLastError();
-            char buf[96];
-            snprintf(buf, sizeof(buf), "options write failed (err=%lu)%s",
-                     static_cast<unsigned long>(err),
-                     err == ERROR_ACCESS_DENIED ? " access denied" : "");
-            r.detail = buf;
-            return r;
-        }
+        if (!dryRun && !WriteFileUtf8Atomic(r.path, next))
+            return writeFail("options");
         xml = next;
-        changed = true;
-        notes.push_back("CustomEdid=true PreventSpoof=true");
     }
 
-    // 3) Mirror baked modes into XML <resolutions> (IddCx mode list source).
-    // Do NOT rewrite from hello sizes anymore.
-    const std::vector<ModeKey> need = ExpandWanted(BakedMttModes());
+    // 3) XML <resolutions> = exactly `modes`, same order (IddCx mode list source).
+    const std::vector<ModeKey> need = ExpandWanted(modes);
     const std::vector<ModeKey> present = ParseResolutions(xml);
-    if (!SameModeSet(present, need)) {
+    if (present != need) {
+        notes.push_back("XML resolutions differ");
         const std::string rewritten = ReplaceResolutionsXml(xml, need);
         if (rewritten.empty()) {
             r.detail = "malformed XML (no <resolutions>)";
             return r;
         }
-        if (!WriteFileUtf8Atomic(r.path, rewritten)) {
-            const DWORD err = GetLastError();
-            char buf[96];
-            snprintf(buf, sizeof(buf), "resolutions write failed (err=%lu)%s",
-                     static_cast<unsigned long>(err),
-                     err == ERROR_ACCESS_DENIED ? " access denied" : "");
-            r.detail = buf;
-            return r;
-        }
+        if (!dryRun && !WriteFileUtf8Atomic(r.path, rewritten))
+            return writeFail("resolutions");
         xml = rewritten;
-        changed = true;
         r.added = static_cast<int>(need.size());
-        notes.push_back("mirrored " + std::to_string(need.size()) + " baked modes into XML");
     }
 
-    if (!changed) {
-        r.ok = true;
-        r.changed = false;
-        r.detail = "CustomEdid already current (bin+flags+baked modes)";
-        return r;
-    }
-
-    std::string reloadDetail;
-    const bool reloaded = ReloadMttVddDevice(reloadDetail);
     r.ok = true;
-    r.changed = true;
-    r.detail.clear();
+    r.changed = !notes.empty();
     for (size_t i = 0; i < notes.size(); ++i) {
         if (i)
             r.detail += "; ";
         r.detail += notes[i];
     }
+    if (!r.changed) {
+        r.detail = "EDID + flags + XML modes already current";
+        return r;
+    }
+    if (dryRun)
+        return r;
+
+    std::string reloadDetail;
+    const bool reloaded = ReloadMttVddDevice(reloadDetail);
     r.detail += "; " + reloadDetail;
     if (!reloaded)
         r.detail += " (reload soft-failed; files written)";
     return r;
 }
 
-std::vector<MttMode> BuildIpadModeList(uint32_t helloW, uint32_t helloH)
+} // namespace
+
+MttEnsureResult EnsureCustomEdid()
 {
-    // Exclusive OpenDisplay MTT head: landscape hello-native aspect (+ scales).
-    // Other iPad class sizes kept only when aspect matches within ~1%.
-    // No portrait duplicates — Windows Display orientation handles that.
-    static const MttMode kCommon[] = {
-        {2352, 1632, 60}, // 2360x1640 (11" class)
-        {2384, 1664, 60}, // 2388x1668 (newer 11)
-        {2720, 2048, 60}, // 2732x2048 (12.9)
-        {2256, 1488, 60}, // 2266x1488 (mini)
-    };
-
-    if (helloH > helloW)
-        std::swap(helloW, helloH);
-
-    std::vector<MttMode> out;
-    auto pushUnique = [&](uint32_t w, uint32_t h) {
-        if (w == 0 || h == 0)
-            return;
-        if (h > w)
-            std::swap(w, h);
-        for (const MttMode& m : out)
-            if (m.width == w && m.height == h)
-                return;
-        out.push_back({w, h, 60});
-    };
-
-    auto align16Floor = [](uint32_t v) -> uint32_t { return v & ~15u; };
-
-    pushUnique(helloW, helloH);
-    // 3/4 and 1/2 native, 16-aligned, same aspect (within floor error).
-    pushUnique(align16Floor(helloW * 3 / 4), align16Floor(helloH * 3 / 4));
-    pushUnique(align16Floor(helloW / 2), align16Floor(helloH / 2));
-
-    for (const MttMode& m : kCommon) {
-        if (MatchesHelloAspect(helloW, helloH, m.width, m.height))
-            pushUnique(m.width, m.height);
+    // Shipped fallback: assets/mtt/user_edid.bin next to the exe (11" default).
+    const std::wstring shipped = FindShippedUserEdid();
+    std::vector<uint8_t> bytes;
+    if (shipped.empty() || !ReadFileBytes(shipped, bytes)) {
+        MttEnsureResult r;
+        r.path = FindLiveSettingsPath();
+        r.detail = "shipped user_edid.bin not found (assets/mtt/user_edid.bin)";
+        return r;
     }
-    return out;
+    return EnsureCustomEdidBytes(bytes, BakedMttModes(), /*dryRun=*/false);
+}
+
+MttEnsureResult EnsureCustomEdidForHello(uint32_t helloW, uint32_t helloH, bool dryRun)
+{
+    const std::vector<MttMode> modes = MttModesForHello(helloW, helloH);
+    const std::vector<uint8_t> edid = BuildMttEdid(modes);
+    if (edid.empty()) {
+        MttEnsureResult r;
+        r.path = FindLiveSettingsPath();
+        r.detail = "EDID generation failed";
+        return r;
+    }
+    return EnsureCustomEdidBytes(edid, modes, dryRun);
 }
 
 MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted)
@@ -1097,13 +1369,14 @@ MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted)
 
 bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH)
 {
-    (void)helloW;
-    (void)helloH;
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
         return false;
-    // Legacy name still accepted by main; prefer --ensure-mtt-edid.
+    // The elevated child regenerates the same bytes from the hello size
+    // (deterministic), writes them and reloads MttVDD. No size -> shipped file.
     std::wstring args = L"--ensure-mtt-edid";
+    if (helloW && helloH)
+        args += L" " + std::to_wstring(helloW) + L"x" + std::to_wstring(helloH);
 
     SHELLEXECUTEINFOW sei{};
     sei.cbSize = sizeof(sei);
@@ -1122,46 +1395,67 @@ bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH)
     return code == 0;
 }
 
+namespace {
+// Hello size whose EDID-change UAC prompt was declined/failed this run
+// (w << 32 | h). Reconnects / link flaps of that iPad don't prompt again until
+// the app restarts.
+std::atomic<uint64_t> g_mttEdidDeclinedKey{0};
+} // namespace
+
 bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag)
 {
-    // Hello sizes are no longer written into XML <resolutions>. Modes + stable
-    // serial live in user_edid.bin (CustomEdid); XML mirrors the baked set.
-    MttEnsureResult r = EnsureCustomEdid();
+    // Runs BEFORE the MTT head is attached (SenderApp::buildPipeline). Same
+    // iPad again = bytes/XML already match = no UAC, no reload.
+    const std::vector<MttMode> modes = MttModesForHello(helloW, helloH);
+    Logf(logTag, "mtt: EDID modes for hello %ux%u: %s\n", helloW, helloH, FormatModes(modes).c_str());
 
-    if (r.ok && !r.changed) {
-        Logf(logTag, "MTT VDD settings: CustomEdid current for hello %ux%u path=%s\n", helloW, helloH,
-             NarrowPath(r.path).c_str());
+    const MttEnsureResult probe = EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/true);
+    if (!probe.ok) {
+        Logf(logTag, "mtt: EDID check failed (%s) - keeping installed EDID\n", probe.detail.c_str());
+        return false;
+    }
+    if (!probe.changed) {
+        Logf(logTag, "mtt: EDID current for this iPad (no write, no reload) path=%s\n", NarrowPath(probe.path).c_str());
         return true;
     }
+    Logf(logTag, "mtt: EDID update needed for hello %ux%u (%s)\n", helloW, helloH, probe.detail.c_str());
 
-    if (!r.ok && r.detail.find("access denied") != std::string::npos) {
-        Logf(logTag, "MTT VDD settings: CustomEdid write needs admin, elevating...\n");
-        if (!SelfElevateEnsure(helloW, helloH)) {
-            Logf(logTag, "MTT VDD settings: elevate failed or UAC declined - CustomEdid may be incomplete\n");
-            return false;
-        }
-        r = EnsureCustomEdid();
-        if (r.ok) {
-            Logf(logTag, "MTT VDD settings: CustomEdid ensured (via elevate) for hello %ux%u path=%s\n", helloW,
-                 helloH, NarrowPath(r.path).c_str());
-            if (!r.detail.empty())
-                Logf(logTag, "MTT VDD settings: %s\n", r.detail.c_str());
-            return true;
-        }
-        Logf(logTag, "MTT VDD settings: post-elevate CustomEdid incomplete (%s)\n", r.detail.c_str());
+    if (ProcessIsElevated()) {
+        const MttEnsureResult r = EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/false);
+        Logf(logTag, "mtt: EDID install %s (%s)\n", r.ok ? "done" : "failed", r.detail.c_str());
+        if (r.ok)
+            g_mttPositionedThisAttach = false; // head re-enumerated: apply saved layout once
+        return r.ok;
+    }
+
+    const uint64_t key = (static_cast<uint64_t>(helloW) << 32) | helloH;
+    if (g_mttEdidDeclinedKey.load() == key) {
+        Logf(logTag, "mtt: admin prompt for this size was declined earlier this run - connecting with the "
+                     "installed EDID\n");
         return false;
     }
 
-    if (r.ok) {
-        Logf(logTag, "MTT VDD settings: CustomEdid updated for hello %ux%u path=%s\n", helloW, helloH,
-             NarrowPath(r.path).c_str());
-        if (!r.detail.empty())
-            Logf(logTag, "MTT VDD settings: %s\n", r.detail.c_str());
-        return true;
+    NotifyUser(L"Setting up this iPad's screen size (one time only).");
+    Logf(logTag, "mtt: EDID install needs admin, elevating...\n");
+    if (!SelfElevateEnsure(helloW, helloH)) {
+        Logf(logTag, "mtt: UAC declined or elevated EDID install failed - connecting with the installed EDID\n");
+        g_mttEdidDeclinedKey.store(key);
+        if (!FileExists(kLiveEdidPath)) {
+            // Nothing installed at all: best effort with the shipped 11" file
+            // (may still need admin to reload; never blocks the connection).
+            const MttEnsureResult fb = EnsureCustomEdid();
+            Logf(logTag, "mtt: shipped fallback EDID %s (%s)\n", fb.ok ? "installed" : "not installed",
+                 fb.detail.c_str());
+        }
+        return false;
     }
-
-    Logf(logTag, "MTT VDD settings: CustomEdid ensure failed (%s)\n", r.detail.c_str());
-    return false;
+    const MttEnsureResult after = EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/true);
+    if (after.ok && !after.changed)
+        Logf(logTag, "mtt: EDID installed for hello %ux%u (driver reloaded)\n", helloW, helloH);
+    else
+        Logf(logTag, "mtt: EDID still differs after elevated install (%s)\n", after.detail.c_str());
+    g_mttPositionedThisAttach = false; // head re-enumerated: apply saved layout once
+    return after.ok && !after.changed;
 }
 
 
@@ -1328,18 +1622,25 @@ bool EnsureMttVddAttached(const std::string& logTag)
 
     // CDS-detached (or not yet on desktop): find the MTT device and attach it.
     if (FindMttVirtualMonitorDevice(mon, /*requireAttached=*/false)) {
-        // Prefer last saved landscape mode; else hello-native default. Restore
-        // below reasserts position (and mode) from mtt_display.json.
-        uint32_t attachW = 2352, attachH = 1632, attachHz = 60;
+        // Saved mode if this iPad's EDID offers it, else the preferred
+        // (hello-native) mode. Restore below reasserts position from
+        // mtt_display.json.
+        const std::vector<MttMode> offered = CurrentMttModes();
+        uint32_t attachW = offered[0].width, attachH = offered[0].height, attachHz = offered[0].hz;
         int attachX = 0, attachY = 0;
         bool havePos = false;
         {
             MttTopology saved{};
             if (LoadTopologyFile(saved) && saved.valid && saved.width > 0 && saved.height > 0) {
-                attachW = saved.width;
-                attachH = saved.height;
-                if (saved.hz != 0)
-                    attachHz = saved.hz;
+                if (ModeOffered(offered, saved.width, saved.height)) {
+                    attachW = saved.width;
+                    attachH = saved.height;
+                    if (saved.hz != 0)
+                        attachHz = saved.hz;
+                } else {
+                    Logf(logTag, "mtt: saved mode %ux%u not offered for this iPad - using preferred %ux%u\n",
+                         saved.width, saved.height, attachW, attachH);
+                }
                 attachX = saved.x;
                 attachY = saved.y;
                 havePos = true;
@@ -1395,15 +1696,18 @@ bool EnsureMttVddAttached(const std::string& logTag)
             Logf(logTag, "mtt: re-enabled MTT1337 monitor node\n");
             (void)WaitForMttMonitor(/*wantPresent=*/true, 8000);
             if (FindMttVirtualMonitorDevice(mon, /*requireAttached=*/false)) {
-                uint32_t aw = 2352, ah = 1632, ahz = 60;
+                const std::vector<MttMode> offered = CurrentMttModes();
+                uint32_t aw = offered[0].width, ah = offered[0].height, ahz = offered[0].hz;
                 int ax = 0, ay = 0;
                 bool hp = false;
                 MttTopology saved{};
                 if (LoadTopologyFile(saved) && saved.valid && saved.width > 0 && saved.height > 0) {
-                    aw = saved.width;
-                    ah = saved.height;
-                    if (saved.hz != 0)
-                        ahz = saved.hz;
+                    if (ModeOffered(offered, saved.width, saved.height)) {
+                        aw = saved.width;
+                        ah = saved.height;
+                        if (saved.hz != 0)
+                            ahz = saved.hz;
+                    }
                     ax = saved.x;
                     ay = saved.y;
                     hp = !SavedRectOverlapsOthers(mon.deviceName, ax, ay, aw, ah);
@@ -1655,6 +1959,8 @@ bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz)
     MttTopology t{};
     if (!LoadTopologyFile(t) || !t.valid || t.width == 0 || t.height == 0)
         return false;
+    if (!ModeOffered(CurrentMttModes(), t.width, t.height))
+        return false; // e.g. saved on another iPad size: caller uses the preferred mode
     width = t.width;
     height = t.height;
     hz = t.hz;
@@ -1679,6 +1985,16 @@ bool RestoreMttDisplayTopology(const std::string& logTag)
 
     bool modeOk = true;
     if (t.width > 0 && t.height > 0) {
+        // Only reapply the saved mode if this iPad's EDID offers it; otherwise
+        // use the new preferred mode. Position restore below is unchanged.
+        const std::vector<MttMode> offered = CurrentMttModes();
+        if (!ModeOffered(offered, t.width, t.height)) {
+            Logf(logTag, "mtt: saved mode %ux%u not offered for this iPad - using preferred %ux%u\n", t.width,
+                 t.height, offered[0].width, offered[0].height);
+            t.width = offered[0].width;
+            t.height = offered[0].height;
+            t.hz = offered[0].hz;
+        }
         const uint32_t applyHz = t.hz ? t.hz : 60u;
         const bool already =
             haveDm && dm.dmPelsWidth == t.width && dm.dmPelsHeight == t.height &&

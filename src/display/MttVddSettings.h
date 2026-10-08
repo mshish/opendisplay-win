@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -10,11 +11,14 @@ namespace od {
 
 // MTT Virtual Display Driver live config lives at
 // C:\VirtualDisplayDriver\{vdd_settings.xml,user_edid.bin}.
-// Mode list + stable monitor identity come from a shipped user_edid.bin
-// (CustomEdid=true). XML <resolutions> is kept mirrored to the same baked
-// landscape set because stock MTT still feeds IddCx QueryTargetModes from XML
-// (CustomEdid alone does not emulate resolutions). Writing the live path +
-// reloading MttVDD needs admin; the self-elevate one-shot covers that.
+// The mode list is generated per iPad from its hello size (MttModesForHello)
+// and written as user_edid.bin (CustomEdid=true, fixed MTT/0x1337/"ODW1"
+// identity so Windows keeps it the same monitor) plus mirrored XML
+// <resolutions> (stock MTT still feeds IddCx QueryTargetModes from XML).
+// Writing the live path + reloading MttVDD needs admin; the self-elevating
+// --ensure-mtt-edid WxH one-shot covers that, and only runs when the bytes
+// actually change. The shipped assets/mtt/user_edid.bin (11" default) is the
+// fallback when no hello size is known.
 
 struct MttMode {
     uint32_t width = 0;
@@ -33,31 +37,55 @@ struct MttEnsureResult {
 // Prefer C:\VirtualDisplayDriver\vdd_settings.xml when present.
 std::wstring FindLiveSettingsPath();
 
-// Fixed landscape modes baked into assets/mtt/user_edid.bin (and mirrored in XML).
-// Preferred / native first. Regenerated via tools/gen_user_edid.py.
+// THE single source of MTT modes. Landscape (long side first), 16-px floor
+// aligned, @60 Hz, max 4 (EDID DTD slots): native hello size (preferred), the
+// closest-aspect sibling iPad panel (aspect within 1%, width within 8%), 3/4
+// and 1/2 of native. Invalid / >4095 sizes fall back to the 2360x1640 list.
+// Mirrored by tools/gen_user_edid.py modes_for_size (byte-identical EDID).
+std::vector<MttMode> MttModesForHello(uint32_t helloW, uint32_t helloH);
+
+// EDID 1.3 (128 bytes) for `modes`: fixed MTT / 0x1337 / serial "ODW1",
+// CVT-RB-ish DTD per mode (preferred first), physical size from the preferred
+// mode (~265 ppi), unused slots = monitor name / dummy, checksum. Empty on
+// invalid input.
+std::vector<uint8_t> BuildMttEdid(const std::vector<MttMode>& modes);
+
+// Shipped fallback list (= MttModesForHello(2360, 1640), the modes baked into
+// assets/mtt/user_edid.bin).
 std::vector<MttMode> BakedMttModes();
 
-// Hello native size + same-aspect scales (1/2, 3/4) and matching iPad-class
-// sizes (~1% aspect). Kept for diagnostics; ensure path no longer rewrites XML
-// from hello (uses BakedMttModes + CustomEdid instead).
-std::vector<MttMode> BuildIpadModeList(uint32_t helloW, uint32_t helloH);
+// Modes the driver currently offers (live XML <resolutions>, preferred first);
+// BakedMttModes when unreadable. Used to validate a saved mode.
+std::vector<MttMode> CurrentMttModes();
 
 // Install/refresh C:\VirtualDisplayDriver\user_edid.bin from the shipped asset,
 // set CustomEdid=true + PreventSpoof=true, mirror BakedMttModes into XML
 // <resolutions>, reload MttVDD. Idempotent when already current.
 MttEnsureResult EnsureCustomEdid();
 
+// Same for the EDID generated from a hello size. dryRun: report whether
+// anything differs (r.changed) without writing or reloading.
+MttEnsureResult EnsureCustomEdidForHello(uint32_t helloW, uint32_t helloH, bool dryRun);
+
 // Rewrite <resolutions> to the wanted set only (prune other aspects) without
 // touching gpu/options/monitors. Prefer EnsureCustomEdid for the sender path.
 // Needs admin to write the live path; returns ok=false with detail on denial.
 MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted);
 
-// Elevated one-shot used by --ensure-mtt-resolutions / --ensure-mtt-edid.
+// Elevated one-shot: runs `--ensure-mtt-edid WxH` (shipped file when 0x0).
 bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH);
 
-// Sender entry: EnsureCustomEdid (shipped bin + CustomEdid + baked XML modes).
-// helloW/H kept for log context only. UAC decline -> log and return false.
+// Sender entry, called before the MTT head attaches: generate the EDID for
+// this hello size; if bytes / flags / XML modes differ from what is installed,
+// show the one-time notice and self-elevate to write + reload MttVDD. No
+// change -> no UAC, no reload. UAC declined / failure -> log, keep the
+// installed EDID (shipped fallback if none), return false; never blocks the
+// connection.
 bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag);
+
+// Optional UI hook (tray balloon) shown right before an EDID-change UAC prompt.
+// Called on a sender thread; the callee must marshal to its UI thread.
+void SetMttUserNotifier(std::function<void(const std::wstring&)> fn);
 
 // Read <monitors><count> from live settings. Returns -1 if missing/unreadable.
 int ReadMonitorCount();
@@ -113,8 +141,10 @@ bool SaveMttDisplayTopology(const std::string& logTag);
 // layout changes. Used by ACCESS_LOST, WM_DISPLAYCHANGE and the streaming poll.
 bool SaveMttDisplayTopologyIfUserChange(const std::string& logTag);
 
-// True when mtt_display.json has a usable width x height (hz optional; 0 -> caller
-// picks a default). Does not touch the desktop.
+// True when mtt_display.json has a usable width x height that the current
+// iPad's EDID offers (hz optional; 0 -> caller picks a default). A mode saved
+// for a different iPad size returns false so the caller uses the preferred
+// mode. Does not touch the desktop.
 bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz);
 
 // After CDS attach: find the MTT head by identity and reapply saved x,y and
