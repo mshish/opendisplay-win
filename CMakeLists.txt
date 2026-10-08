@@ -65,10 +65,11 @@ target_compile_definitions(opendisplay-win PRIVATE
 )
 
 # asInvoker (not requireAdministrator): the app runs un-elevated. The only
-# operation that needs admin is registering a new iPad resolution as a
-# parsec-vdd custom mode (one HKLM write); that path self-elevates a one-off
-# (`--register-resolution`). Running the whole app elevated is optional (tray
-# menu) — only needed to inject touch into elevated windows.
+# operations that need admin are writes to the MTT driver's settings dir
+# (C:\VirtualDisplayDriver: user_edid.bin, vdd_settings.xml flags / monitor
+# count); those self-elevate a one-off (`--ensure-mtt-edid`,
+# `--set-mtt-monitor-count`). Running the whole app elevated is optional (tray
+# menu) - only needed to inject touch into elevated windows.
 #
 # GUI subsystem so the tray app doesn't flash a console window, but keep
 # mainCRTStartup as the entry point so we still have a normal main(argc, argv)

@@ -32,10 +32,6 @@ namespace {
 
 constexpr wchar_t kLiveSettingsPath[] = L"C:\\VirtualDisplayDriver\\vdd_settings.xml";
 constexpr wchar_t kLiveEdidPath[] = L"C:\\VirtualDisplayDriver\\user_edid.bin";
-constexpr wchar_t kAppsSettingsPath[] = L"D:\\apps\\VirtualDisplayDriver\\vdd_settings.intel.xml";
-constexpr wchar_t kAppsEdidPath[] = L"D:\\apps\\VirtualDisplayDriver\\user_edid.bin";
-// Dev-tree fallback when running an unpackaged build from the repo.
-constexpr wchar_t kDevEdidPath[] = L"D:\\projects\\opendisplay-win\\assets\\mtt\\user_edid.bin";
 
 // Display adapter class.
 const GUID kDisplayClassGuid = {
@@ -589,8 +585,6 @@ std::wstring FindShippedUserEdid()
     const std::wstring candidates[] = {
         exeDir + L"\\assets\\mtt\\user_edid.bin",
         exeDir + L"\\user_edid.bin",
-        kDevEdidPath,
-        kAppsEdidPath,
         kLiveEdidPath,
     };
     for (const std::wstring& c : candidates) {
@@ -913,8 +907,6 @@ MttEnsureResult EnsureCustomEdid()
             r.detail = buf;
             return r;
         }
-        if (GetFileAttributesW(L"D:\\apps\\VirtualDisplayDriver") != INVALID_FILE_ATTRIBUTES)
-            (void)WriteFileBytesAtomic(kAppsEdidPath, bytes);
         changed = true;
         notes.push_back(edidPresent ? "refreshed user_edid.bin" : "installed user_edid.bin");
     }
@@ -972,9 +964,6 @@ MttEnsureResult EnsureCustomEdid()
             r.detail = buf;
             return r;
         }
-        if (FileExists(kAppsSettingsPath) ||
-            GetFileAttributesW(L"D:\\apps\\VirtualDisplayDriver") != INVALID_FILE_ATTRIBUTES)
-            (void)WriteFileUtf8Atomic(kAppsSettingsPath, rewritten);
         xml = rewritten;
         changed = true;
         r.added = static_cast<int>(need.size());
@@ -1090,10 +1079,6 @@ MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted)
         r.detail = buf;
         return r;
     }
-
-    // Best-effort keep the install-source template in sync for future installs.
-    if (FileExists(kAppsSettingsPath) || GetFileAttributesW(L"D:\\apps\\VirtualDisplayDriver") != INVALID_FILE_ATTRIBUTES)
-        (void)WriteFileUtf8Atomic(kAppsSettingsPath, rewritten);
 
     std::string reloadDetail;
     const bool reloaded = ReloadMttVddDevice(reloadDetail);
@@ -1241,9 +1226,6 @@ MttEnsureResult SetMonitorCount(uint32_t count)
             r.detail = buf;
             return r;
         }
-        if (FileExists(kAppsSettingsPath) ||
-            GetFileAttributesW(L"D:\\apps\\VirtualDisplayDriver") != INVALID_FILE_ATTRIBUTES)
-            (void)WriteFileUtf8Atomic(kAppsSettingsPath, rewritten);
     }
 
     std::string reloadDetail;
